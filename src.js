@@ -19,26 +19,146 @@
     let steamRequestsQueue = []; // Массив для хранения очереди задач
     let steamCache = {};
     let isQueueRunning = false; // Флаг, запущен ли процесс обработки
+    let currentOperation = null;
+    let operationId = 0;
 
-    async function processNextSteamRequest() {
+    function createOperation() {
+        currentOperation = {
+            id: ++operationId,
+            cancelled: false,
+            cleanups: new Set()
+        };
+        return currentOperation;
+    }
+
+    function isOperationActive(operation) {
+        return operation && currentOperation === operation && !operation.cancelled;
+    }
+
+    function setStartButtonLoading(isLoading) {
+        const btn = document.getElementById('start-combine');
+        if (!btn) return;
+
+        btn.disabled = false;
+        if (isLoading) {
+            btn.classList.remove('lis-btn-disabled');
+            btn.classList.add('lis-btn-cancel');
+            btn.innerHTML = `<span class="lis-spinner"></span>Отмена`;
+        } else {
+            btn.classList.remove('lis-btn-disabled', 'lis-btn-cancel');
+            btn.innerText = 'Найти выгодные';
+        }
+    }
+
+    function finishOperation(operation, statusText = '') {
+        if (currentOperation !== operation) return;
+
+        currentOperation = null;
+        isQueueRunning = false;
+        steamRequestsQueue = [];
+        setStartButtonLoading(false);
+
+        const statusDiv = document.getElementById('combine-status');
+        if (statusDiv && statusText) statusDiv.innerText = statusText;
+    }
+
+    function cancelCurrentOperation() {
+        const operation = currentOperation;
+        if (!operation) return false;
+
+        operation.cancelled = true;
+        steamRequestsQueue = [];
+        operation.cleanups.forEach(cleanup => cleanup());
+        operation.cleanups.clear();
+        finishOperation(operation, 'Отменено.');
+        return true;
+    }
+
+    function waitForOperation(operation, delay, onTick = null) {
+        if (!isOperationActive(operation)) return Promise.resolve();
+
+        return new Promise(resolve => {
+            let finished = false;
+            const startedAt = Date.now();
+            const finish = () => {
+                if (finished) return;
+                finished = true;
+                operation.cleanups.delete(cleanup);
+                clearTimeout(timerId);
+                if (intervalId) clearInterval(intervalId);
+                resolve();
+            };
+
+            const tick = () => {
+                if (!onTick || !isOperationActive(operation)) return;
+
+                const remainingMs = Math.max(delay - (Date.now() - startedAt), 0);
+                onTick(Math.ceil(remainingMs / 1000));
+            };
+
+            const timerId = setTimeout(finish, delay);
+            const intervalId = onTick ? setInterval(tick, 1000) : null;
+
+            const cleanup = () => {
+                finish();
+            };
+
+            operation.cleanups.add(cleanup);
+            tick();
+        });
+    }
+
+    function updateSteamProgress(operation, prefix = 'Загрузка цен Steam') {
+        if (!isOperationActive(operation) || !operation.steamProgress) return;
+
+        const statusDiv = document.getElementById('combine-status');
+        if (!statusDiv) return;
+
+        const total = operation.steamProgress.total;
+        const completed = operation.steamProgress.completed;
+        const current = Math.min(completed + 1, total);
+        const remaining = Math.max(total - completed, 0);
+
+        statusDiv.innerText = `${prefix}: ${current}/${total}, осталось ${remaining}`;
+    }
+
+    function getWorkersCount() {
+        const input = document.getElementById('workers-num-input');
+        let value = input ? parseInt(input.value) : parseInt(localStorage.getItem('lis_helper_workers_count'));
+
+        if (!value || value < 1) value = 3;
+        if (value > 7) value = 7;
+
+        return value;
+    }
+
+    async function processNextSteamRequest(operation) {
         if (isQueueRunning) return; // Предотвращаем повторный множественный запуск менеджера
         isQueueRunning = true;
 
-        const CONCURRENCY = 7; // Количество одновременных запросов к Steam
+        const concurrency = getWorkersCount(); // Количество одновременных запросов к Steam
         const statusDiv = document.getElementById('combine-status');
+        operation.steamProgress = {
+            total: steamRequestsQueue.length,
+            completed: 0
+        };
+        updateSteamProgress(operation);
 
         // Функция-воркер, которая берет задачи из общей очереди
         const worker = async () => {
-            while (steamRequestsQueue.length > 0) {
+            while (steamRequestsQueue.length > 0 && isOperationActive(operation)) {
                 const task = steamRequestsQueue.shift();
                 if (!task) continue;
+                updateSteamProgress(operation);
 
                 // ШАГ 1: Проверка кэша. Если этот скин уже загружали — берем данные мгновенно
                 if (steamCache[task.marketHashName]) {
                     const cached = steamCache[task.marketHashName];
                     task.targetLinkElement.innerText = formatPriceWithProfit(cached.priceText, task.targetLinkElement, cached.ordersCount);
-                    task.targetLinkElement.style.background = '#43b581';
                     task.totalCard.setAttribute('data-calculated-profit', cached.calculatedProfit);
+                    applyProfitBadgeColor(task.targetLinkElement, cached.calculatedProfit);
+                    operation.steamProgress.completed++;
+                    updateSteamProgress(operation);
 
                     continue;
                 }
@@ -47,12 +167,24 @@
                 task.targetLinkElement.innerText = 'Загрузка...';
 
                 await new Promise((resolve) => {
-                    fetchSteamPriceFromHTML(task.targetUrl, task.marketHashName, task.targetLinkElement, task.totalCard, (status, data) => {
+                    let completed = false;
+                    const finishTask = async (status, data) => {
+                        if (completed) return;
+                        completed = true;
+                        operation.cleanups.delete(cleanup);
+
+                        if (!isOperationActive(operation)) {
+                            resolve();
+                            return;
+                        }
+
                         if (status === 429) {
-                            if (statusDiv) statusDiv.innerText = "Steam Блок 429! Пауза 30с...";
                             steamRequestsQueue.unshift(task); // Возвращаем в очередь
                             task.targetLinkElement.innerText = 'Пауза 429...';
-                            setTimeout(resolve, 30000); // При блоке жесткая пауза 30 сек
+                            await waitForOperation(operation, 60000, (secondsLeft) => {
+                                updateSteamProgress(operation, `Steam Блок 429! Ретрай через ${secondsLeft}с. Цены Steam`);
+                            }); // При блоке жесткая пауза 60 сек
+                            resolve();
                         } else {
                             // Сохраняем успешный результат в кэш, чтобы не запрашивать повторно дубликаты
                             if (status === 200 && data) {
@@ -60,33 +192,39 @@
                             }
                             // Безопасная, но ускоренная пауза между запросами в одном потоке (1.2 - 2 секунды)
                             const delay = 1200 + Math.random() * 800;
-                            setTimeout(resolve, delay);
+                            await waitForOperation(operation, delay);
+                            operation.steamProgress.completed++;
+                            updateSteamProgress(operation);
+                            resolve();
                         }
-                    });
+                    };
+
+                    const request = fetchSteamPriceFromHTML(task.targetUrl, task.marketHashName, task.targetLinkElement, task.totalCard, operation, finishTask);
+                    const cleanup = () => {
+                        if (completed) return;
+                        completed = true;
+                        if (request && typeof request.abort === 'function') request.abort();
+                        resolve();
+                    };
+                    operation.cleanups.add(cleanup);
                 });
             }
         };
 
         // Запускаем параллельных воркера из одного пула задач
-        const workers = Array(CONCURRENCY).fill(null).map(() => worker());
+        const workers = Array(concurrency).fill(null).map(() => worker());
         // Ждем, пока абсолютно все воркеры закончат работу с пулом задач
         await Promise.all(workers);
+
+        if (!isOperationActive(operation)) return;
 
         // Железно вызываем сортировку один раз, когда всё гарантированно готово
         sortCardsByProfit();
 
-        // Возвращаем кнопку в исходное активное состояние
-        const btn = document.getElementById('start-combine');
-        if (btn) {
-            btn.disabled = false;
-            btn.classList.remove('lis-btn-disabled');
-            btn.innerText = 'Загрузить и отфильтровать';
-        }
-
         // Выводим всплывающее уведомление об успешном окончании
         showSuccessToast('Обновление цен и сортировка успешно завершены!');
 
-        isQueueRunning = false;
+        finishOperation(operation);
     }
 
     // Функция вывода всплывающих уведомлений об ошибках (исчезает через 10 сек)
@@ -167,11 +305,16 @@
                 cursor: not-allowed !important;
                 background: #4f545c !important;
             }
+            .lis-btn-cancel {
+                background: #f04747 !important;
+                cursor: pointer !important;
+            }
         `;
         document.head.appendChild(style);
 
         const savedDiff = localStorage.getItem('lis_helper_min_diff') || '0';
         const savedPages = localStorage.getItem('lis_helper_pages_count') || '2';
+        const savedWorkers = localStorage.getItem('lis_helper_workers_count') || '3';
 
         const panel = document.createElement('div');
         panel.id = 'lis-helper-panel';
@@ -184,7 +327,7 @@
         `;
 
         panel.innerHTML = `
-            <div style="margin-bottom: 12px; font-weight: bold; color: #ff9800; text-align: center;">Мульти-страничный фильтр</div>
+            <div style="margin-bottom: 12px; font-weight: bold; color: #ff9800; text-align: center;">Profit-Calculator</div>
 
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
                 <label>Мин. скидка (%):</label>
@@ -208,7 +351,18 @@
                 width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: #7289da;
             ">
 
-            <button id="start-combine" style="width: 100%; background: #7289da; color: white; border: none; padding: 8px; border-radius: 4px; cursor: pointer; font-weight: bold;">Загрузить и отфильтровать</button>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+                <label>Воркеров Steam:</label>
+                <input type="number" id="workers-num-input" min="1" max="7" value="${Math.min(parseInt(savedWorkers), 7)}" style="
+                    width: 50px; background: #2f3136; color: #43b581; border: 1px solid #4f545c;
+                    padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
+                ">
+            </div>
+            <input type="range" id="workers-to-load" min="1" max="7" value="${Math.min(parseInt(savedWorkers), 7)}" style="
+                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: #43b581;
+            ">
+
+            <button id="start-combine" style="width: 100%; background: #43b581; color: white; border: none; padding: 8px; border-radius: 4px; cursor: pointer; font-weight: bold;">Найти выгодные</button>
             <div id="combine-status" style="margin-top: 8px; color: #aaa; font-size: 11px; text-align: center;"></div>
         `;
 
@@ -220,6 +374,8 @@
             const pagesNumber = document.getElementById('pages-num-input');
             const diffSlider = document.getElementById('min-diff-input');
             const diffNumber = document.getElementById('diff-num-input');
+            const workersSlider = document.getElementById('workers-to-load');
+            const workersNumber = document.getElementById('workers-num-input');
 
             pagesSlider.addEventListener('input', function() {
                 pagesNumber.value = this.value;
@@ -242,18 +398,33 @@
                 diffSlider.value = Math.min(val, 80);
                 localStorage.setItem('lis_helper_min_diff', val);
             });
+            workersSlider.addEventListener('input', function() {
+                workersNumber.value = this.value;
+                localStorage.setItem('lis_helper_workers_count', this.value);
+            });
+            workersNumber.addEventListener('input', function() {
+                let val = parseInt(this.value) || 3;
+                if (val > 7) val = 7; if (val < 1) val = 1;
+                this.value = val;
+                workersSlider.value = val;
+                localStorage.setItem('lis_helper_workers_count', val);
+            });
 
             document.getElementById('start-combine').addEventListener('click', loadMorePages);
         }
     }
 
     // Парсинг цены автовыкупа на основе реальной DOM-структуры страницы Steam
-    function fetchSteamPriceFromHTML(targetUrl, marketHashName, targetLinkElement, totalCard, onComplete) {
+    function fetchSteamPriceFromHTML(targetUrl, marketHashName, targetLinkElement, totalCard, operation, onComplete) {
 
-        GM_xmlhttpRequest({
+        const request = GM_xmlhttpRequest({
             method: "GET",
             url: targetUrl,
             onload: function(response) {
+                if (!isOperationActive(operation)) {
+                    if (onComplete) onComplete('cancelled');
+                    return;
+                }
 
                 if (response.status === 429) {
                     if (onComplete) onComplete(429);
@@ -271,6 +442,12 @@
                 }
                 try {
                     const htmlText = response.responseText;
+                    const normalizedHtmlText = htmlText.replace(/\s+/g, ' ');
+                    if (normalizedHtmlText.includes('За недавнее время вы отправили слишком много запросов. Повторите попытку позже.')) {
+                        if (onComplete) onComplete(429);
+                        return;
+                    }
+
                     const parser = new DOMParser();
                     const doc = parser.parseFromString(htmlText, 'text/html');
 
@@ -299,7 +476,6 @@
                             // Передаем количество сделок в функцию форматирования текста
                             targetLinkElement.innerText = formatPriceWithProfit(priceText, targetLinkElement, ordersCount);
 
-                            targetLinkElement.style.background = '#43b581';
                             priceFound = true;
 
                             // Сохраняем выгоду в карточку для последующей сортировки
@@ -309,6 +485,7 @@
                             // Записываем профит напрямую в колбэк и в дата-атрибут карточки здесь
                             const calculatedProfit = steamPrice - lisPrice;
                             totalCard.setAttribute('data-calculated-profit', calculatedProfit);
+                            applyProfitBadgeColor(targetLinkElement, calculatedProfit);
 
                             if (onComplete) onComplete(200, { priceText, ordersCount, calculatedProfit });
 
@@ -337,13 +514,22 @@
 
             },
             onerror: function(err) {
+                if (!isOperationActive(operation)) {
+                    if (onComplete) onComplete('cancelled');
+                    return;
+                }
                 console.error(`[LIS Helper Network Error] Сбой сети для "${marketHashName}":`, err);
                 targetLinkElement.innerText = "Сбой сети";
                 targetLinkElement.style.background = '#f04747';
                 totalCard.setAttribute('data-calculated-profit', -999999);
                 if (onComplete) onComplete('error');
+            },
+            onabort: function() {
+                if (onComplete) onComplete('cancelled');
             }
         });
+
+        return request;
     }
 
     // Вспомогательная функция для расчета чистой выгоды (Цена Steam - Цена LIS-SKINS)
@@ -358,9 +544,51 @@
         if (lisPrice > 0) {
             const profit = steamPrice - lisPrice;
             const profitSign = profit > 0 ? '+' : '';
-            resultText += ` (${profitSign}${profit.toFixed(2)} p.)`;
+            const profitPercent = (profit / lisPrice) * 100;
+            resultText += ` (${profitSign}${profit.toFixed(2)} p., ${profitSign}${profitPercent.toFixed(2)}%)`;
         }
         return resultText;
+    }
+
+    function getValidProfit(card) {
+        const profit = parseFloat(card.getAttribute('data-calculated-profit'));
+        return Number.isFinite(profit) && profit > -999998 ? profit : null;
+    }
+
+    function getProfitPercentFromBadge(badge, profit) {
+        const lisPrice = parseFloat(badge.getAttribute('data-lis-price')) || 0;
+        return lisPrice > 0 && profit !== null ? (profit / lisPrice) * 100 : null;
+    }
+
+    function getProfitPercentFromCard(card) {
+        const badge = card.querySelector('.steam-highest-buy-order-link');
+        if (!badge) return null;
+
+        const profit = getValidProfit(card);
+        return getProfitPercentFromBadge(badge, profit);
+    }
+
+    function applyProfitBadgeColor(badge, profit) {
+        const PROFITABLE_PERCENT_THRESHOLD = 20;
+        const profitPercent = getProfitPercentFromBadge(badge, profit);
+
+        if (profit !== null && profit < 0) {
+            badge.style.background = '#f04747';
+        } else if (profitPercent !== null && profitPercent > PROFITABLE_PERCENT_THRESHOLD) {
+            badge.style.background = '#43b581';
+        } else {
+            badge.style.background = '#ff9800';
+        }
+    }
+
+    function updateProfitBadgeColors(cardsArray) {
+        cardsArray.forEach(card => {
+            const badge = card.querySelector('.steam-highest-buy-order-link');
+            if (!badge) return;
+
+            const profit = getValidProfit(card);
+            applyProfitBadgeColor(badge, profit);
+        });
     }
 
     // Функция сортировки карточек по значению выгоды (от большего к меньшему)
@@ -376,18 +604,22 @@
 
         // Сортируем: карточки с большей выгодой идут вверх. Карточки без данных уходят вниз.
         cardsArray.sort((a, b) => {
-            const profitA = parseFloat(a.getAttribute('data-calculated-profit')) || -999998;
-            const profitB = parseFloat(b.getAttribute('data-calculated-profit')) || -999998;
-            return profitB - profitA;
+            const profitPercentA = getProfitPercentFromCard(a);
+            const profitPercentB = getProfitPercentFromCard(b);
+
+            return (profitPercentB ?? -999998) - (profitPercentA ?? -999998);
         });
 
         // Перепривязываем элементы в DOM в новом порядке
         cardsArray.forEach(card => gridContainer.appendChild(card));
+        updateProfitBadgeColors(cardsArray);
 
         if (statusDiv) statusDiv.innerText = "Готово! Отсортировано.";
     }
 
-    function applyDiffFilter() {
+    function applyDiffFilter(operation) {
+        if (!isOperationActive(operation)) return;
+
         const minVal = parseFloat(document.getElementById('diff-num-input').value) || 0;
         const allCards = document.querySelectorAll('.skins-market-skins-list .item');
 
@@ -422,7 +654,7 @@
                         steamLink.className = 'steam-highest-buy-order-link';
                         steamLink.target = '_blank';
                         steamLink.style = `
-                        position: absolute; top: 10px; left: 10px; z-index: 9999;
+                        position: absolute; top: 10px; left: 10px; z-index: 30;
                         background: #ff9800; color: #fff !important; padding: 3px 8px;
                         font-size: 11px; font-weight: bold; border-radius: 4px;
                         text-decoration: none !important; box-shadow: 0 2px 5px rgba(0,0,0,0.3);
@@ -453,31 +685,38 @@
             }
         });
 
-        if (!isQueueRunning) {
-            processNextSteamRequest();
+        if (!isQueueRunning && isOperationActive(operation)) {
+            processNextSteamRequest(operation);
         }
 
     }
 
     async function loadMorePages() {
+        if (currentOperation) {
+            cancelCurrentOperation();
+            return;
+        }
+
+        const operation = createOperation();
         const statusDiv = document.getElementById('combine-status');
 
-        // Находим кнопку и блокируем её, добавляя спиннер
-        const btn = document.getElementById('start-combine');
-        if (btn) {
-            btn.disabled = true;
-            btn.classList.add('lis-btn-disabled');
-            btn.innerHTML = `<span class="lis-spinner"></span>Загрузка...`;
-        }
+        setStartButtonLoading(true);
 
         let pagesCount = parseInt(document.getElementById('pages-num-input').value) || 1;
 
         pagesCount = Math.min(pagesCount, 99);
 
         const gridContainer = document.querySelector('.skins-market-skins-list');
-        if (!gridContainer) { statusDiv.innerText = "Ошибка сетки!"; return; }
+        if (!gridContainer) {
+            finishOperation(operation, "Ошибка сетки!");
+            return;
+        }
 
-        if (pagesCount <= 1) { applyDiffFilter(); statusDiv.innerText = "Фильтр 1-й стр."; return; }
+        if (pagesCount <= 1) {
+            applyDiffFilter(operation);
+            if (isOperationActive(operation)) statusDiv.innerText = "Фильтр 1-й стр.";
+            return;
+        }
 
         document.querySelectorAll('.item.loaded-by-script').forEach(el => el.remove());
         document.querySelectorAll('.skins-market-skins-list > .item').forEach(card => card.style.display = '');
@@ -488,12 +727,22 @@
         for (let p = 2; p <= pagesCount; p++) {
             searchParams.set('page', p);
             const targetUrl = `${baseUrl}?${searchParams.toString()}`;
-            statusDiv.innerText = `Загрузка страницы ${p}...`;
+            if (!isOperationActive(operation)) return;
+            statusDiv.innerText = `Загрузка страницы ${p}/${pagesCount}, осталось ${pagesCount - p}`;
 
+            let cleanup = null;
             try {
-                const response = await fetch(targetUrl);
+                const controller = new AbortController();
+                cleanup = () => controller.abort();
+                operation.cleanups.add(cleanup);
+
+                const response = await fetch(targetUrl, { signal: controller.signal });
+                if (!isOperationActive(operation)) return;
+
                 if (!response.ok) throw new Error();
                 const htmlText = await response.text();
+                operation.cleanups.delete(cleanup);
+                if (!isOperationActive(operation)) return;
 
                 const parser = new DOMParser();
                 const doc = parser.parseFromString(htmlText, 'text/html');
@@ -507,25 +756,26 @@
                     addedInThisPage++;
                 });
                 if (addedInThisPage === 0) break;
-            } catch (err) { break; }
+            } catch (err) {
+                if (cleanup) operation.cleanups.delete(cleanup);
+                if (!isOperationActive(operation)) return;
+                break;
+            }
         }
 
+        if (!isOperationActive(operation)) return;
         statusDiv.innerText = "Фильтрация...";
 
-        applyDiffFilter();
+        applyDiffFilter(operation);
 
         // Если страниц для обработки не оказалось (очередь пуста), разблокируем кнопку сразу здесь.
         // Если карточки есть, разблокировка произойдет в конце processNextSteamRequest.
         if (steamRequestsQueue.length === 0) {
-            if (btn) {
-                btn.disabled = false;
-                btn.classList.remove('lis-btn-disabled');
-                btn.innerText = 'Загрузить и отфильтровать';
-            }
+            finishOperation(operation, 'Готово!');
             showSuccessToast('Фильтрация завершена. Нет подходящих карточек.');
+        } else if (isOperationActive(operation)) {
+            statusDiv.innerText = `Загрузка цен Steam...`;
         }
-
-        statusDiv.innerText = `Готово!`;
     }
 
     const observer = new MutationObserver((mutations, obs) => {
