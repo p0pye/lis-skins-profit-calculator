@@ -253,6 +253,7 @@
                         if (status === 429) {
                             steamRequestsQueue.unshift(task); // Возвращаем в очередь
                             task.targetLinkElement.innerText = 'Пауза 429...';
+                            task.targetLinkElement.style.background = '#7289da';
                             sortCardsByProfit();
                             await pauseSteamGlobally(operation);
                             resolve();
@@ -760,7 +761,7 @@
 
                     if (!priceFound) {
                         targetLinkElement.innerText = "Нет заявок";
-                        targetLinkElement.style.background = '#ff9800';
+                        targetLinkElement.style.background = '#607d8b';
 
                         // Если заявок нет, явно ставим низкий приоритет для сортировки
                         totalCard.setAttribute('data-calculated-profit', -999999);
@@ -982,7 +983,11 @@
         const PROFITABLE_PERCENT_THRESHOLD = 20;
         const profitPercent = getProfitPercentFromBadge(badge, profit);
 
-        if (profit !== null && profit < 0) {
+        if (badge.innerText === 'Пауза 429...') {
+            badge.style.background = '#7289da';
+        } else if (badge.innerText === 'Нет заявок') {
+            badge.style.background = '#607d8b';
+        } else if (profit !== null && profit < 0) {
             badge.style.background = '#f04747';
         } else if (profitPercent !== null && profitPercent > PROFITABLE_PERCENT_THRESHOLD) {
             badge.style.background = '#43b581';
@@ -1044,15 +1049,15 @@
         allCards.forEach(totalCard => {
             totalCard.style.position = 'relative';
             const elem = totalCard.querySelector('.steam-price-discount');
-            if (!elem || !elem.hasAttribute('data-diff-value')) {
-                totalCard.style.display = 'none';
-                return;
+            let passesDiffFilter = minVal <= 0;
+
+            if (elem && elem.hasAttribute('data-diff-value')) {
+                const rawAttr = elem.getAttribute('data-diff-value') || '';
+                const attrValue = parseFloat(rawAttr.replace('%', ''));
+                passesDiffFilter = passesDiffFilter || (!isNaN(attrValue) && attrValue >= minVal);
             }
 
-            const rawAttr = elem.getAttribute('data-diff-value') || '';
-            const attrValue = parseFloat(rawAttr.replace('%', ''));
-
-            if (!isNaN(attrValue) && attrValue >= minVal) {
+            if (passesDiffFilter) {
                 totalCard.style.display = '';
                 if (!totalCard.querySelector('.steam-highest-buy-order-link')) {
                     let itemName = getMarketHashNameFromCard(totalCard);
