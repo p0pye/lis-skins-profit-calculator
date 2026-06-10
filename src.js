@@ -121,8 +121,21 @@
         const completed = operation.steamProgress.completed;
         const current = Math.min(completed + 1, total);
         const remaining = Math.max(total - completed, 0);
+        const elapsedMs = Date.now() - operation.steamProgress.startedAt;
+        const etaText = completed > 0 && remaining > 0
+            ? `, примерно ${formatDuration((elapsedMs / completed) * remaining)}`
+            : '';
 
-        statusDiv.innerText = `${prefix}: ${current}/${total}, осталось ${remaining}`;
+        statusDiv.innerText = `${prefix}: ${current}/${total}, осталось ${remaining}${etaText}`;
+    }
+
+    function formatDuration(milliseconds) {
+        const totalSeconds = Math.max(Math.ceil(milliseconds / 1000), 0);
+        const minutes = Math.floor(totalSeconds / 60);
+        const seconds = totalSeconds % 60;
+
+        if (minutes <= 0) return `${seconds}с`;
+        return `${minutes}м ${seconds.toString().padStart(2, '0')}с`;
     }
 
     function pauseSteamGlobally(operation) {
@@ -206,7 +219,8 @@
         const concurrency = getWorkersCount(); // Количество одновременных запросов к Steam
         operation.steamProgress = {
             total: steamRequestsQueue.length,
-            completed: 0
+            completed: 0,
+            startedAt: Date.now()
         };
         updateSteamProgress(operation);
 
