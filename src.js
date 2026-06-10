@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         lis-skins-profit-calculator
 // @namespace    http://tampermonkey.net
-// @version      12.5
+// @version      13.0
 // @description  lis-skins-profit-calculator
-// @author       AI Helper
+// @author       p0pye + AI Helper
 // @match        https://lis-skins.com/*/market/*
 // @icon         https://google.com
 // @grant        GM_xmlhttpRequest
@@ -157,6 +157,46 @@
         if (value > 10) value = 10;
 
         return value;
+    }
+
+    function encodeSteamMarketHashName(marketHashName) {
+        return encodeURIComponent(marketHashName).replace(/[!'()*|]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+    }
+
+    function normalizeItemName(value) {
+        return (value || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function findCsWearText(totalCard) {
+        const wearMatch = normalizeItemName(totalCard.textContent).match(/\b(Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\b/i);
+        return wearMatch ? wearMatch[1] : '';
+    }
+
+    function getMarketHashNameFromCard(totalCard) {
+        const candidates = [];
+        const addCandidate = (value) => {
+            const normalized = normalizeItemName(value);
+            if (normalized) candidates.push(normalized);
+        };
+
+        ['data-market-hash-name', 'data-name', 'data-title'].forEach(attr => addCandidate(totalCard.getAttribute(attr)));
+
+        totalCard.querySelectorAll('[data-market-hash-name], [data-name], [data-title], img[alt], img[title], a[title]').forEach(element => {
+            ['data-market-hash-name', 'data-name', 'data-title', 'alt', 'title'].forEach(attr => addCandidate(element.getAttribute(attr)));
+        });
+
+        const titleElem = totalCard.querySelector('.name, .item-name, .inner-name');
+        addCandidate(titleElem ? titleElem.textContent : '');
+
+        const wearPattern = /\((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)$/i;
+        let itemName = candidates.find(candidate => wearPattern.test(candidate)) || candidates.sort((a, b) => b.length - a.length)[0] || '';
+        const wearText = findCsWearText(totalCard);
+
+        if (wearText && itemName && !wearPattern.test(itemName)) {
+            itemName = `${itemName} (${wearText})`;
+        }
+
+        return itemName;
     }
 
     async function processNextSteamRequest(operation) {
@@ -1015,9 +1055,7 @@
             if (!isNaN(attrValue) && attrValue >= minVal) {
                 totalCard.style.display = '';
                 if (!totalCard.querySelector('.steam-highest-buy-order-link')) {
-                    // ОПТИМИЗАЦИЯ: Группировка селекторов в один запрос
-                    const titleElem = totalCard.querySelector('.name, .item-name, .inner-name');
-                    let itemName = titleElem ? titleElem.innerText.trim() : "";
+                    let itemName = getMarketHashNameFromCard(totalCard);
 
                     if (itemName) {
                         const steamLink = document.createElement('a');
@@ -1039,7 +1077,7 @@
                         const lisPrice = lisPriceElem ? parseFloat(lisPriceElem.innerText.replace(/[^0-9.,]/g, '').replace(',', '.')) : 0;
                         steamLink.setAttribute('data-lis-price', lisPrice);
 
-                        const targetSteamUrl = `https://steamcommunity.com/market/listings/${currentAppId}/${encodeURIComponent(itemName)}`;
+                        const targetSteamUrl = `https://steamcommunity.com/market/listings/${currentAppId}/${encodeSteamMarketHashName(itemName)}`;
                         steamLink.setAttribute('href', targetSteamUrl);
                         totalCard.appendChild(steamLink);
 
