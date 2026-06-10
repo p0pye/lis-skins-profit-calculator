@@ -352,8 +352,13 @@
     }
 
     // Инициализация и отрисовка боковой панели управления
+    function shouldInjectPanel() {
+        return Boolean(document.querySelector('.skins-market-skins-list > .item'));
+    }
+
     function injectPanel() {
         if (panelInjected || document.getElementById('lis-helper-panel')) return;
+        if (!shouldInjectPanel()) return;
 
         const style = document.createElement('style');
         style.textContent = `
@@ -444,7 +449,7 @@
                 background: #111318;
                 border: 1px solid #4f545c;
                 color: #fff;
-                font-size: 11px;
+                font-size: 12px;
                 font-weight: normal;
                 line-height: 1.3;
                 box-shadow: 0 4px 12px rgba(0,0,0,0.45);
@@ -462,7 +467,7 @@
                 padding: 8px;
                 font-family: sans-serif;
                 font-size: 11px;
-                pointer-events: none;
+                pointer-events: auto;
                 width: min(760px, calc(100vw - 16px));
                 box-sizing: border-box;
                 overflow: hidden;
@@ -487,6 +492,14 @@
             }
             .lis-profit-tooltip td {
                 white-space: nowrap;
+            }
+            .lis-profit-cell-positive {
+                background: #2e8b57;
+                color: #fff;
+            }
+            .lis-profit-cell-negative {
+                background: #bd362f;
+                color: #fff;
             }
         `;
         document.head.appendChild(style);
@@ -805,13 +818,13 @@
 
         // Формируем базовую строку цены и добавляем количество сделок (ордеров), если оно передано
         const ordersText = ordersCount ? ` [${ordersCount} шт.]` : '';
-        let resultText = `${steamPrice.toFixed(2)} p.${ordersText}`;
+        let resultText = `${formatCurrency(steamPrice)}${ordersText}`;
 
         if (lisPrice > 0) {
             const profit = calculateNetProfit(steamPrice, lisPrice);
             const profitSign = profit > 0 ? '+' : '';
             const profitPercent = (profit / lisPrice) * 100;
-            resultText += ` (${profitSign}${profit.toFixed(2)} p., ${profitSign}${profitPercent.toFixed(2)}%)`;
+            resultText += ` (${formatMoney(profit)}, ${profitSign}${profitPercent.toFixed(2)}%)`;
         }
         return resultText;
     }
@@ -838,9 +851,16 @@
         return calculateSteamSale(steamPrice, lisPrice).netProfit;
     }
 
+    function formatCurrency(value) {
+        return new Intl.NumberFormat('ru-RU', {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2
+        }).format(value) + ' ₽';
+    }
+
     function formatMoney(value) {
         const sign = value > 0 ? '+' : '';
-        return `${sign}${value.toFixed(2)} p.`;
+        return `${sign}${formatCurrency(value)}`;
     }
 
     function escapeHtml(value) {
@@ -880,16 +900,22 @@
         badge.setAttribute('data-steam-breakdown', JSON.stringify(rows));
     }
 
+    function getProfitCellClass(value) {
+        if (value > 0) return 'lis-profit-cell-positive';
+        if (value < 0) return 'lis-profit-cell-negative';
+        return '';
+    }
+
     function buildBreakdownTooltipHtml(rows) {
         const bodyRows = rows.map(row => `
             <tr>
-                <td>${row.buyPrice.toFixed(2)} p.</td>
-                <td>${row.salePrice.toFixed(2)} p.</td>
+                <td>${formatCurrency(row.buyPrice)}</td>
+                <td>${formatCurrency(row.salePrice)}</td>
                 <td>${escapeHtml(row.lotsCount || '-')}</td>
-                <td>${formatMoney(row.grossProfit)}</td>
-                <td>${row.commission.toFixed(2)} p.</td>
-                <td>${row.netSale.toFixed(2)} p.</td>
-                <td>${formatMoney(row.netProfit)}</td>
+                <td class="${getProfitCellClass(row.grossProfit)}">${formatMoney(row.grossProfit)}</td>
+                <td>${formatCurrency(row.commission)}</td>
+                <td>${formatCurrency(row.netSale)}</td>
+                <td class="${getProfitCellClass(row.netProfit)}">${formatMoney(row.netProfit)}</td>
             </tr>
         `).join('');
 
@@ -913,6 +939,7 @@
 
     function attachProfitTooltip(badge) {
         let hoverTimer = null;
+        let hideTimer = null;
         let tooltip = null;
 
         const removeTooltip = () => {
@@ -920,14 +947,32 @@
                 clearTimeout(hoverTimer);
                 hoverTimer = null;
             }
+            if (hideTimer) {
+                clearTimeout(hideTimer);
+                hideTimer = null;
+            }
             if (tooltip) {
                 tooltip.remove();
                 tooltip = null;
             }
         };
 
+        const scheduleRemoveTooltip = () => {
+            if (hoverTimer) {
+                clearTimeout(hoverTimer);
+                hoverTimer = null;
+            }
+            if (hideTimer) clearTimeout(hideTimer);
+            hideTimer = setTimeout(removeTooltip, 250);
+        };
+
         badge.addEventListener('mouseenter', () => {
-            removeTooltip();
+            if (hideTimer) {
+                clearTimeout(hideTimer);
+                hideTimer = null;
+            }
+            if (tooltip) return;
+            if (hoverTimer) clearTimeout(hoverTimer);
             hoverTimer = setTimeout(() => {
                 const rowsRaw = badge.getAttribute('data-steam-breakdown');
                 if (!rowsRaw) return;
@@ -954,10 +999,17 @@
 
                 tooltip.style.left = `${Math.max(left, 8)}px`;
                 tooltip.style.top = `${Math.max(top, 8)}px`;
+                tooltip.addEventListener('mouseenter', () => {
+                    if (hideTimer) {
+                        clearTimeout(hideTimer);
+                        hideTimer = null;
+                    }
+                });
+                tooltip.addEventListener('mouseleave', scheduleRemoveTooltip);
             }, 2000);
         });
 
-        badge.addEventListener('mouseleave', removeTooltip);
+        badge.addEventListener('mouseleave', scheduleRemoveTooltip);
         badge.addEventListener('click', removeTooltip);
     }
 
@@ -1196,8 +1248,10 @@
     const observer = new MutationObserver((mutations, obs) => {
         if (document.body && !panelInjected) {
             injectPanel();
-            // ОПТИМИЗАЦИЯ: Отключаем observer, так как панель уже создана
-            obs.disconnect();
+            if (panelInjected) {
+                // ОПТИМИЗАЦИЯ: Отключаем observer, так как панель уже создана
+                obs.disconnect();
+            }
         }
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
