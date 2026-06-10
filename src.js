@@ -222,7 +222,7 @@
         sortCardsByProfit();
 
         // Выводим всплывающее уведомление об успешном окончании
-        showSuccessToast('Обновление цен и сортировка успешно завершены!');
+        showSuccessToast('Обработка завершена!');
 
         finishOperation(operation);
     }
@@ -244,7 +244,7 @@
             box-shadow: 0 4px 12px rgba(0,0,0,0.5); border-left: 5px solid #bd362f;
             opacity: 1; transition: opacity 0.5s ease-in-out; min-width: 250px;
         `;
-        toast.innerText = `⚠️ LIS Helper: ${message}`;
+        toast.innerText = `⚠️ Profit Calculator ${message}`;
         container.appendChild(toast);
 
         setTimeout(() => {
@@ -270,7 +270,7 @@
             box-shadow: 0 4px 12px rgba(0,0,0,0.5); border-left: 5px solid #2e8b57;
             opacity: 1; transition: opacity 0.5s ease-in-out; min-width: 250px;
         `;
-        toast.innerHTML = `✅ LIS Helper: ${message}`;
+        toast.innerHTML = `✅ Profit Calculator: ${message}`;
         container.appendChild(toast);
 
         setTimeout(() => {
@@ -432,7 +432,7 @@
                 }
 
                 if (response.status !== 200) {
-                    console.error(`[LIS Helper Error] Код ${response.status} для "${marketHashName}"`);
+                    console.error(`[Profit Calculator Error] Код ${response.status} для "${marketHashName}"`);
                     showErrorToast(`Steam заблокировал запрос (Код ${response.status}). Сделайте паузу.`);
                     targetLinkElement.innerText = `Блок ${response.status}`;
                     targetLinkElement.style.background = '#f04747';
@@ -504,7 +504,7 @@
                         //console.Error(htmlText);
                     }
                 } catch (e) {
-                    console.error(`[LIS Helper Error] Сбой обработки DOM для "${marketHashName}":`, e);
+                    console.error(`[Profit Calculator Error] Сбой обработки DOM для "${marketHashName}":`, e);
                     targetLinkElement.innerText = "Ошибка структуры";
                     targetLinkElement.style.background = '#f04747';
                     // При ошибке структуры также уводим карточку вниз
@@ -518,7 +518,7 @@
                     if (onComplete) onComplete('cancelled');
                     return;
                 }
-                console.error(`[LIS Helper Network Error] Сбой сети для "${marketHashName}":`, err);
+                console.error(`[Profit Calculator Network Error] Сбой сети для "${marketHashName}":`, err);
                 targetLinkElement.innerText = "Сбой сети";
                 targetLinkElement.style.background = '#f04747';
                 totalCard.setAttribute('data-calculated-profit', -999999);
