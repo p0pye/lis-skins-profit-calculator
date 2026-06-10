@@ -26,6 +26,7 @@
         currentOperation = {
             id: ++operationId,
             cancelled: false,
+            steamRetryCount: 0,
             cleanups: new Set()
         };
         return currentOperation;
@@ -181,9 +182,12 @@
                         if (status === 429) {
                             steamRequestsQueue.unshift(task); // Возвращаем в очередь
                             task.targetLinkElement.innerText = 'Пауза 429...';
-                            await waitForOperation(operation, 60000, (secondsLeft) => {
+                            sortCardsByProfit();
+                            operation.steamRetryCount++;
+                            const retryDelay = 60000 + ((operation.steamRetryCount - 1) * 30000);
+                            await waitForOperation(operation, retryDelay, (secondsLeft) => {
                                 updateSteamProgress(operation, `Steam Блок 429! Ретрай через ${secondsLeft}с. Цены Steam`);
-                            }); // При блоке жесткая пауза 60 сек
+                            }); // При каждом Steam-ретрае в рамках поиска пауза растет на 30 сек
                             resolve();
                         } else {
                             // Сохраняем успешный результат в кэш, чтобы не запрашивать повторно дубликаты
@@ -309,6 +313,31 @@
                 background: #f04747 !important;
                 cursor: pointer !important;
             }
+            .lis-number-control {
+                display: flex;
+                align-items: stretch;
+                gap: 3px;
+            }
+            .lis-stepper-buttons {
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+            }
+            .lis-stepper {
+                width: 18px;
+                height: 13px;
+                padding: 0;
+                border: 1px solid #4f545c;
+                border-radius: 3px;
+                background: #36393e;
+                color: #fff;
+                cursor: pointer;
+                font-size: 8px;
+                line-height: 10px;
+            }
+            .lis-stepper:hover {
+                background: #4f545c;
+            }
         `;
         document.head.appendChild(style);
 
@@ -331,10 +360,16 @@
 
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
                 <label>Мин. скидка (%):</label>
-                <input type="number" id="diff-num-input" min="0" max="100" value="${savedDiff}" style="
-                    width: 50px; background: #2f3136; color: #ff9800; border: 1px solid #4f545c;
-                    padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
-                ">
+                <div class="lis-number-control">
+                    <input type="number" id="diff-num-input" min="0" max="100" value="${savedDiff}" style="
+                        width: 50px; background: #2f3136; color: #ff9800; border: 1px solid #4f545c;
+                        padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
+                    ">
+                    <div class="lis-stepper-buttons">
+                        <button type="button" class="lis-stepper" data-step-target="diff-num-input" data-step-delta="1">▲</button>
+                        <button type="button" class="lis-stepper" data-step-target="diff-num-input" data-step-delta="-1">▼</button>
+                    </div>
+                </div>
             </div>
             <input type="range" id="min-diff-input" min="0" max="80" value="${Math.min(parseInt(savedDiff), 80)}" step="1" style="
                 width: 100%; margin-bottom: 15px; cursor: pointer; accent-color: #ff9800;
@@ -342,10 +377,16 @@
 
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
                 <label>Страниц собрать:</label>
-                <input type="number" id="pages-num-input" min="1" max="99" value="${savedPages}" style="
-                    width: 50px; background: #2f3136; color: #7289da; border: 1px solid #4f545c;
-                    padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
-                ">
+                <div class="lis-number-control">
+                    <input type="number" id="pages-num-input" min="1" max="99" value="${savedPages}" style="
+                        width: 50px; background: #2f3136; color: #7289da; border: 1px solid #4f545c;
+                        padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
+                    ">
+                    <div class="lis-stepper-buttons">
+                        <button type="button" class="lis-stepper" data-step-target="pages-num-input" data-step-delta="1">▲</button>
+                        <button type="button" class="lis-stepper" data-step-target="pages-num-input" data-step-delta="-1">▼</button>
+                    </div>
+                </div>
             </div>
             <input type="range" id="pages-to-load" min="1" max="99" value="${savedPages}" style="
                 width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: #7289da;
@@ -353,10 +394,16 @@
 
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
                 <label>Воркеров Steam:</label>
-                <input type="number" id="workers-num-input" min="1" max="7" value="${Math.min(parseInt(savedWorkers), 7)}" style="
-                    width: 50px; background: #2f3136; color: #43b581; border: 1px solid #4f545c;
-                    padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
-                ">
+                <div class="lis-number-control">
+                    <input type="number" id="workers-num-input" min="1" max="7" value="${Math.min(parseInt(savedWorkers), 7)}" style="
+                        width: 50px; background: #2f3136; color: #43b581; border: 1px solid #4f545c;
+                        padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
+                    ">
+                    <div class="lis-stepper-buttons">
+                        <button type="button" class="lis-stepper" data-step-target="workers-num-input" data-step-delta="1">▲</button>
+                        <button type="button" class="lis-stepper" data-step-target="workers-num-input" data-step-delta="-1">▼</button>
+                    </div>
+                </div>
             </div>
             <input type="range" id="workers-to-load" min="1" max="7" value="${Math.min(parseInt(savedWorkers), 7)}" style="
                 width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: #43b581;
@@ -376,6 +423,38 @@
             const diffNumber = document.getElementById('diff-num-input');
             const workersSlider = document.getElementById('workers-to-load');
             const workersNumber = document.getElementById('workers-num-input');
+
+            function stepInputValue(input, delta) {
+                const min = parseInt(input.getAttribute('min')) || 0;
+                const max = parseInt(input.getAttribute('max')) || 100;
+                const step = parseInt(input.getAttribute('step')) || 1;
+                let value = parseInt(input.value);
+                if (isNaN(value)) value = min;
+
+                value += delta * step;
+                if (value > max) value = max;
+                if (value < min) value = min;
+
+                input.value = value;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+
+            panel.querySelectorAll('.lis-stepper').forEach(button => {
+                button.addEventListener('click', function() {
+                    const input = document.getElementById(this.getAttribute('data-step-target'));
+                    if (!input) return;
+
+                    const delta = parseInt(this.getAttribute('data-step-delta')) || 0;
+                    stepInputValue(input, delta);
+                });
+            });
+
+            [diffNumber, diffSlider, pagesNumber, pagesSlider, workersNumber, workersSlider].forEach(input => {
+                input.addEventListener('wheel', function(event) {
+                    event.preventDefault();
+                    stepInputValue(this, event.deltaY < 0 ? 1 : -1);
+                }, { passive: false });
+            });
 
             pagesSlider.addEventListener('input', function() {
                 pagesNumber.value = this.value;
