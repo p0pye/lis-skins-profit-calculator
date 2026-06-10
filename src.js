@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         lis-skins-profit-calculator
 // @namespace    http://tampermonkey.net
-// @version      13.0
+// @version      12.5
 // @description  lis-skins-profit-calculator
-// @author       p0pye + AI Helper
+// @author       AI Helper
 // @match        https://lis-skins.com/*/market/*
 // @icon         https://google.com
 // @grant        GM_xmlhttpRequest
@@ -1024,7 +1024,7 @@
                         steamLink.className = 'steam-highest-buy-order-link';
                         steamLink.target = '_blank';
                         steamLink.style = `
-                        position: absolute; top: 10px; left: 10px; right: 10px; z-index: 30;
+                        position: absolute; top: 32px; left: 10px; right: 10px; z-index: 30;
                         background: #ff9800; color: #fff !important; padding: 3px 8px;
                         font-size: 11px; font-weight: bold; border-radius: 4px;
                         text-decoration: none !important; box-shadow: 0 2px 5px rgba(0,0,0,0.3);
