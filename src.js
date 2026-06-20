@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         lis-skins-profit-calculator
 // @namespace    http://tampermonkey.net
-// @version      13.0
+// @version      15.1
 // @description  lis-skins-profit-calculator
 // @author       p0pye + AI Helper
 // @match        https://lis-skins.com/*/market/*
-// @icon         https://google.com
+// @icon         https://www.google.com/s2/favicons?domain=lis-skins.com&sz=64
 // @grant        GM_xmlhttpRequest
 // @connect      steamcommunity.com
 // @run-at       document-start
@@ -16,11 +16,15 @@
 
     let panelInjected = false;
     let steamRequestsQueue = []; // Массив для хранения очереди задач
-    let steamCache = {};
+    const steamCache = new Map();
     let isQueueRunning = false; // Флаг, запущен ли процесс обработки
     let currentOperation = null;
     let operationId = 0;
     const STEAM_SELLER_MULTIPLIER = 1.15;
+    const STEAM_REQUEST_TIMEOUT_MS = 20000;
+    const LIS_PAGE_REQUEST_TIMEOUT_MS = 20000;
+    const MAX_STEAM_429_REQUEUES = 10;
+    const STEAM_CACHE_TTL_MS = 5 * 60 * 1000;
 
     function createOperation() {
         currentOperation = {
@@ -77,6 +81,15 @@
         return true;
     }
 
+    function resetAnalysisResults() {
+        document.querySelectorAll('.steam-highest-buy-order-link[data-lis-helper-badge="true"]').forEach(badge => badge.remove());
+        document.querySelectorAll('.skins-market-skins-list > .item.loaded-by-script').forEach(card => card.remove());
+        document.querySelectorAll('.skins-market-skins-list > .item').forEach(card => {
+            card.removeAttribute('data-calculated-profit');
+            card.style.display = '';
+        });
+    }
+
     function waitForOperation(operation, delay, onTick = null) {
         if (!isOperationActive(operation)) return Promise.resolve();
 
@@ -127,6 +140,16 @@
             : '';
 
         statusDiv.innerText = `${prefix}: ${current}/${total}, осталось ${remaining}${etaText}`;
+    }
+
+    function completeSteamTask(operation) {
+        operation.steamProgress.completed++;
+
+        if (operation.steamProgress.completed % 10 === 0) {
+            sortCardsByProfit(false);
+        }
+
+        updateSteamProgress(operation);
     }
 
     function formatDuration(milliseconds) {
@@ -180,6 +203,40 @@
         return (value || '').replace(/\s+/g, ' ').trim();
     }
 
+    function isValidPrice(value) {
+        return Number.isFinite(value) && value > 0;
+    }
+
+    function setCardPriceError(targetLinkElement, totalCard, message) {
+        targetLinkElement.innerText = message;
+        targetLinkElement.style.background = '#f04747';
+        totalCard.setAttribute('data-calculated-profit', -999999);
+        setSteamBreakdown(targetLinkElement);
+    }
+
+    function setCardNoBuyOrders(targetLinkElement, totalCard) {
+        targetLinkElement.innerText = 'Нет заявок';
+        targetLinkElement.style.background = '#607d8b';
+        totalCard.setAttribute('data-calculated-profit', -999999);
+        setSteamBreakdown(targetLinkElement);
+    }
+
+    function getSteamCacheKey(appId, marketHashName) {
+        return `${appId}:${marketHashName}`;
+    }
+
+    function getFreshSteamCache(cacheKey) {
+        const cached = steamCache.get(cacheKey);
+        if (!cached) return null;
+
+        if (!Number.isFinite(cached.fetchedAt) || Date.now() - cached.fetchedAt >= STEAM_CACHE_TTL_MS) {
+            steamCache.delete(cacheKey);
+            return null;
+        }
+
+        return cached;
+    }
+
     function findCsWearText(totalCard) {
         const wearMatch = normalizeItemName(totalCard.textContent).match(/\b(Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\b/i);
         return wearMatch ? wearMatch[1] : '';
@@ -212,6 +269,111 @@
         return itemName;
     }
 
+    function hasExplicitNoBuyOrdersMessage(doc) {
+        const pageText = normalizeItemName(doc.body?.textContent || '').toLowerCase();
+        const noOrdersMessages = [
+            'нет активных заявок на покупку',
+            'нет заявок на покупку',
+            'заявок на покупку нет',
+            'there are no active buy orders',
+            'there are no buy orders',
+            'no active buy orders',
+            'keine aktiven kaufaufträge',
+            'aucun ordre d’achat actif'
+        ];
+
+        return noOrdersMessages.some(message => pageText.includes(message));
+    }
+
+    function findBuyOrdersTable(labelElement) {
+        const isTable = element => element?.matches?.('table');
+        const findTableInside = element => element?.querySelector?.(':scope > table') || null;
+
+        if (!labelElement) return null;
+
+        let current = labelElement;
+        for (let depth = 0; current && depth < 2; depth++, current = current.parentElement) {
+            const sibling = current.nextElementSibling;
+            if (isTable(sibling)) return sibling;
+
+            const directTable = findTableInside(sibling);
+            if (directTable) return directTable;
+        }
+
+        return null;
+    }
+
+    function getPriceTextFromBuyOrderLabel(element) {
+        if (!element) return null;
+
+        const descendants = Array.from(element.querySelectorAll('span, strong, b')).reverse();
+        const currencyPattern = /(?:₽|\$|€|£|¥|₴|₸|₹|руб\.?|USD|EUR)/i;
+        const withCurrency = descendants.find(candidate => {
+            const text = normalizeItemName(candidate.textContent);
+            return currencyPattern.test(text) && isValidPrice(parsePriceValue(text));
+        });
+        return withCurrency ? normalizeItemName(withCurrency.textContent) : '';
+    }
+
+    function getFirstOrderRowData(table) {
+        if (!table) return null;
+
+        const cells = table.querySelectorAll('tbody tr:first-child td');
+        if (cells.length < 2) return null;
+
+        const priceText = normalizeItemName(cells[0].textContent);
+        if (!isValidPrice(parsePriceValue(priceText))) return null;
+
+        return {
+            priceText,
+            ordersCount: cells[1].textContent.trim().replace(/\s| /g, '')
+        };
+    }
+
+    function findSteamBuyOrders(doc) {
+        const labelFragments = [
+            'заявок на покупку по цене',
+            'заявки на покупку по цене',
+            'buy requests at',
+            'buy orders at',
+            'requests to buy at',
+            'kaufaufträge zum preis',
+            'ordres d’achat au prix',
+            "ordres d'achat au prix",
+            'órdenes de compra a',
+            'ordini di acquisto a',
+            'ofertas de compra a'
+        ];
+
+        const textElements = [];
+        const walker = doc.createTreeWalker(doc.body, 4); // NodeFilter.SHOW_TEXT
+
+        while (walker.nextNode()) {
+            const textNode = walker.currentNode;
+            const text = normalizeItemName(textNode.nodeValue).toLowerCase();
+            if (!labelFragments.some(fragment => text.includes(fragment))) continue;
+
+            const element = textNode.parentElement;
+            if (element && !textElements.includes(element)) textElements.push(element);
+        }
+
+        for (const element of textElements) {
+            const table = findBuyOrdersTable(element);
+            const firstRow = getFirstOrderRowData(table);
+            const priceText = getPriceTextFromBuyOrderLabel(element);
+
+            if (isValidPrice(parsePriceValue(priceText))) {
+                return {
+                    priceText,
+                    ordersCount: firstRow?.ordersCount || '',
+                    table
+                };
+            }
+        }
+
+        return null;
+    }
+
     async function processNextSteamRequest(operation) {
         if (isQueueRunning) return; // Предотвращаем повторный множественный запуск менеджера
         isQueueRunning = true;
@@ -237,14 +399,37 @@
                 updateSteamProgress(operation);
 
                 // ШАГ 1: Проверка кэша. Если этот скин уже загружали — берем данные мгновенно
-                if (steamCache[task.marketHashName]) {
-                    const cached = steamCache[task.marketHashName];
+                const cacheKey = getSteamCacheKey(task.appId, task.marketHashName);
+                const cached = getFreshSteamCache(cacheKey);
+                if (cached) {
+                    if (cached.status === 'no-orders') {
+                        setCardNoBuyOrders(task.targetLinkElement, task.totalCard);
+                        completeSteamTask(operation);
+                        continue;
+                    }
+
+                    const lisPrice = parseFloat(task.targetLinkElement.getAttribute('data-lis-price')) || 0;
+                    const steamPrice = parsePriceValue(cached.priceText);
+
+                    if (!isValidPrice(lisPrice) || !isValidPrice(steamPrice)) {
+                        steamCache.delete(cacheKey);
+                        setCardPriceError(
+                            task.targetLinkElement,
+                            task.totalCard,
+                            !isValidPrice(lisPrice) ? 'Ошибка цены LIS' : 'Ошибка цены Steam'
+                        );
+                        completeSteamTask(operation);
+                        continue;
+                    }
+
+                    const calculatedProfit = calculateNetProfit(steamPrice, lisPrice);
+                    const breakdownRows = calculateSteamBreakdownRows(cached.steamOrderRows, lisPrice);
+
                     task.targetLinkElement.innerText = formatPriceWithProfit(cached.priceText, task.targetLinkElement, cached.ordersCount);
-                    task.totalCard.setAttribute('data-calculated-profit', cached.calculatedProfit);
-                    setSteamBreakdown(task.targetLinkElement, cached.breakdownRows);
-                    applyProfitBadgeColor(task.targetLinkElement, cached.calculatedProfit);
-                    operation.steamProgress.completed++;
-                    updateSteamProgress(operation);
+                    task.totalCard.setAttribute('data-calculated-profit', calculatedProfit);
+                    setSteamBreakdown(task.targetLinkElement, breakdownRows);
+                    applyProfitBadgeColor(task.targetLinkElement, calculatedProfit);
+                    completeSteamTask(operation);
 
                     continue;
                 }
@@ -265,22 +450,34 @@
                         }
 
                         if (status === 429) {
-                            steamRequestsQueue.unshift(task); // Возвращаем в очередь
-                            task.targetLinkElement.innerText = 'Пауза 429...';
-                            task.targetLinkElement.style.background = '#7289da';
-                            sortCardsByProfit();
-                            await pauseSteamGlobally(operation);
+                            task.retry429Count = (task.retry429Count || 0) + 1;
+
+                            if (task.retry429Count <= MAX_STEAM_429_REQUEUES) {
+                                steamRequestsQueue.unshift(task);
+                                task.targetLinkElement.innerText = `Пауза 429 (${task.retry429Count}/${MAX_STEAM_429_REQUEUES})`;
+                                task.targetLinkElement.style.background = '#7289da';
+                                sortCardsByProfit();
+                                await pauseSteamGlobally(operation);
+                            } else {
+                                console.error(`[Profit Calculator Error] Достигнут лимит повторов 429 для "${task.marketHashName}"`);
+                                task.targetLinkElement.innerText = 'Лимит 429 исчерпан';
+                                task.targetLinkElement.style.background = '#f04747';
+                                task.totalCard.setAttribute('data-calculated-profit', -999999);
+                                completeSteamTask(operation);
+                            }
                             resolve();
                         } else {
                             // Сохраняем успешный результат в кэш, чтобы не запрашивать повторно дубликаты
                             if (status === 200 && data) {
-                                steamCache[task.marketHashName] = data;
+                                steamCache.set(cacheKey, {
+                                    ...data,
+                                    fetchedAt: Date.now()
+                                });
                             }
                             // Безопасная, но ускоренная пауза между запросами в одном потоке (1.2 - 2 секунды)
                             const delay = 1200 + Math.random() * 800;
                             await waitForOperation(operation, delay);
-                            operation.steamProgress.completed++;
-                            updateSteamProgress(operation);
+                            completeSteamTask(operation);
                             resolve();
                         }
                     };
@@ -374,8 +571,11 @@
         if (panelInjected || document.getElementById('lis-helper-panel')) return;
         if (!shouldInjectPanel()) return;
 
-        const style = document.createElement('style');
-        style.textContent = `
+        let style = document.getElementById('lis-helper-styles');
+        if (!style) {
+            style = document.createElement('style');
+            style.id = 'lis-helper-styles';
+            style.textContent = `
             @keyframes lis-spin {
                 0% { transform: rotate(0deg); }
                 100% { transform: rotate(360deg); }
@@ -399,6 +599,70 @@
             .lis-btn-cancel {
                 background: #f04747 !important;
                 cursor: pointer !important;
+            }
+            .lis-panel-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+                margin-bottom: 12px;
+            }
+            .lis-panel-title {
+                flex: 1;
+                color: #ff9800;
+                font-weight: bold;
+                text-align: center;
+                white-space: nowrap;
+            }
+            .lis-panel-toggle {
+                width: 24px;
+                height: 24px;
+                padding: 0;
+                border: 1px solid #4f545c;
+                border-radius: 4px;
+                background: #36393e;
+                color: #fff;
+                cursor: pointer;
+                font-family: Arial, "Helvetica Neue", sans-serif;
+                font-size: 14px;
+                line-height: 22px;
+            }
+            .lis-panel-toggle:hover {
+                background: #4f545c;
+            }
+            #lis-helper-panel[data-collapsed="true"] {
+                left: 0 !important;
+                right: auto !important;
+                width: 28px !important;
+                min-width: 28px !important;
+                padding: 7px 3px !important;
+                border-radius: 0 8px 8px 0 !important;
+                box-sizing: border-box !important;
+                cursor: pointer !important;
+            }
+            #lis-helper-panel[data-collapsed="true"] .lis-panel-header {
+                flex-direction: column;
+                justify-content: flex-start;
+                gap: 6px;
+                margin-bottom: 0;
+            }
+            #lis-helper-panel[data-collapsed="true"] .lis-panel-title {
+                order: 2;
+                writing-mode: vertical-rl;
+                transform: rotate(180deg);
+                text-align: left;
+                line-height: 1;
+            }
+            #lis-helper-panel[data-collapsed="true"] .lis-panel-toggle {
+                order: 1;
+                width: 20px;
+                min-width: 20px;
+                height: 20px;
+                font-size: 12px;
+                line-height: 18px;
+            }
+            #lis-helper-panel[data-collapsed="true"] .lis-panel-content {
+                display: none !important;
             }
             .lis-number-control {
                 display: flex;
@@ -479,7 +743,7 @@
                 border-radius: 6px;
                 box-shadow: 0 6px 18px rgba(0,0,0,0.55);
                 padding: 8px;
-                font-family: sans-serif;
+                font-family: Arial, "Helvetica Neue", sans-serif;
                 font-size: 11px;
                 pointer-events: auto;
                 width: min(760px, calc(100vw - 16px));
@@ -515,8 +779,9 @@
                 background: #bd362f;
                 color: #fff;
             }
-        `;
-        document.head.appendChild(style);
+            `;
+            document.head.appendChild(style);
+        }
 
         const savedDiff = localStorage.getItem('lis_helper_min_diff') || '0';
         const savedPages = localStorage.getItem('lis_helper_pages_count') || '2';
@@ -525,6 +790,8 @@
 
         const panel = document.createElement('div');
         panel.id = 'lis-helper-panel';
+        const initiallyCollapsed = localStorage.getItem('lis_helper_panel_collapsed') === '1';
+        panel.setAttribute('data-collapsed', String(initiallyCollapsed));
         panel.style = `
             position: fixed; top: 140px; left: 8px; z-index: 9999999 !important;
             background: #1e2124 !important; color: #fff !important; padding: 12px !important;
@@ -534,8 +801,12 @@
         `;
 
         panel.innerHTML = `
-            <div style="margin-bottom: 12px; font-weight: bold; color: #ff9800; text-align: center;">Profit-Calculator</div>
+            <div class="lis-panel-header">
+                <div class="lis-panel-title">Profit-Calculator</div>
+                <button type="button" id="lis-panel-toggle" class="lis-panel-toggle" aria-label="Свернуть настройки" title="Свернуть настройки">◀</button>
+            </div>
 
+            <div class="lis-panel-content">
             <div class="lis-setting-row">
                 <label>Мин. скидка (%):</label>
                 <div class="lis-number-control">
@@ -610,6 +881,7 @@
 
             <button id="start-combine" style="width: 100%; background: #43b581; color: white; border: none; padding: 8px; border-radius: 4px; cursor: pointer; font-weight: bold;">Найти выгодные</button>
             <div id="combine-status" style="margin-top: 8px; color: #aaa; font-size: 11px; text-align: center;"></div>
+            </div>
         `;
 
         if (document.body) {
@@ -624,6 +896,33 @@
             const workersNumber = document.getElementById('workers-num-input');
             const tooltipRowsSlider = document.getElementById('tooltip-rows-to-load');
             const tooltipRowsNumber = document.getElementById('tooltip-rows-num-input');
+            const panelToggle = document.getElementById('lis-panel-toggle');
+
+            const setPanelCollapsed = (collapsed) => {
+                panel.setAttribute('data-collapsed', String(collapsed));
+                panel.style.setProperty('left', collapsed ? '0' : '8px', 'important');
+                panel.style.setProperty('right', 'auto', 'important');
+                panel.style.setProperty('width', collapsed ? '28px' : '210px', 'important');
+                panel.style.setProperty('min-width', collapsed ? '28px' : '0', 'important');
+                panel.style.setProperty('padding', collapsed ? '7px 3px' : '12px', 'important');
+                panel.style.setProperty('border-radius', collapsed ? '0 8px 8px 0' : '8px', 'important');
+                panel.style.setProperty('box-sizing', 'border-box', 'important');
+                panelToggle.innerText = collapsed ? '▶' : '◀';
+                panelToggle.setAttribute('aria-label', collapsed ? 'Развернуть настройки' : 'Свернуть настройки');
+                panelToggle.title = collapsed ? 'Развернуть настройки' : 'Свернуть настройки';
+                localStorage.setItem('lis_helper_panel_collapsed', collapsed ? '1' : '0');
+            };
+
+            setPanelCollapsed(initiallyCollapsed);
+            panelToggle.addEventListener('click', event => {
+                event.stopPropagation();
+                setPanelCollapsed(panel.getAttribute('data-collapsed') !== 'true');
+            });
+            panel.addEventListener('click', () => {
+                if (panel.getAttribute('data-collapsed') === 'true') {
+                    setPanelCollapsed(false);
+                }
+            });
 
             function stepInputValue(input, delta) {
                 const min = parseInt(input.getAttribute('min')) || 0;
@@ -707,10 +1006,13 @@
 
     // Парсинг цены автовыкупа на основе реальной DOM-структуры страницы Steam
     function fetchSteamPriceFromHTML(targetUrl, marketHashName, targetLinkElement, totalCard, operation, onComplete) {
+        const requestUrl = new URL(targetUrl);
+        requestUrl.searchParams.set('l', 'russian');
 
         const request = GM_xmlhttpRequest({
             method: "GET",
-            url: targetUrl,
+            url: requestUrl.toString(),
+            timeout: STEAM_REQUEST_TIMEOUT_MS,
             onload: function(response) {
                 if (!isOperationActive(operation)) {
                     if (onComplete) onComplete('cancelled');
@@ -742,59 +1044,57 @@
                     const parser = new DOMParser();
                     const doc = parser.parseFromString(htmlText, 'text/html');
 
-                    // ОПТИМИЗАЦИЯ: Ищем сразу элемент, содержащий нужный текст, вместо перебора всех span
-                    const priceContainer = Array.from(doc.querySelectorAll('span')).find(span =>
-                                                                                         span.textContent.includes('Заявок на покупку по цене')
-                                                                                        );
-
+                    const buyOrders = findSteamBuyOrders(doc);
                     let priceFound = false;
-                    if (priceContainer) {
-                        const priceSpan = priceContainer.querySelector('span');
-                        if (priceSpan) {
-                            let priceText = priceSpan.textContent.trim();
-                            // Расчет выгоды и вывод в скобках
+                    if (buyOrders) {
+                        const priceText = buyOrders.priceText;
+                        const ordersCount = buyOrders.ordersCount;
+                        const nextTable = buyOrders.table;
+                        const lisPrice = parseFloat(targetLinkElement.getAttribute('data-lis-price')) || 0;
+                        const steamOrderRows = getSteamOrderRows(nextTable);
+                        const breakdownRows = calculateSteamBreakdownRows(steamOrderRows, lisPrice);
 
-                            // Находим таблицу рядом с текстом цены и берем количество из второй ячейки первой строки
-                            let ordersCount = '';
-                            const nextTable = priceContainer.nextElementSibling || priceContainer.parentElement?.querySelector('table');
-                            const lisPrice = parseFloat(targetLinkElement.getAttribute('data-lis-price')) || 0;
-                            const breakdownRows = getSteamBreakdownRows(nextTable, lisPrice);
-                            if (nextTable) {
-                                const firstRowCells = nextTable.querySelectorAll('tbody tr:first-child td');
-                                if (firstRowCells.length >= 2) {
-                                    ordersCount = firstRowCells[1].textContent.trim().replace(/\s| /g, '');
-                                }
-                            }
+                        targetLinkElement.innerText = formatPriceWithProfit(priceText, targetLinkElement, ordersCount);
+                        priceFound = true;
 
-                            // Передаем количество сделок в функцию форматирования текста
-                            targetLinkElement.innerText = formatPriceWithProfit(priceText, targetLinkElement, ordersCount);
+                        const steamPrice = parsePriceValue(priceText);
 
-                            priceFound = true;
-
-                            // Сохраняем выгоду в карточку для последующей сортировки
-                            const steamPrice = parseFloat(priceText.replace(/[^0-9.,]/g, '').replace(',', '.'));
-
-                            // Записываем профит напрямую в колбэк и в дата-атрибут карточки здесь
-                            const calculatedProfit = calculateNetProfit(steamPrice, lisPrice);
-                            totalCard.setAttribute('data-calculated-profit', calculatedProfit);
-                            setSteamBreakdown(targetLinkElement, breakdownRows);
-                            applyProfitBadgeColor(targetLinkElement, calculatedProfit);
-
-                            if (onComplete) onComplete(200, { priceText, ordersCount, calculatedProfit, breakdownRows });
-
-
+                        if (!isValidPrice(lisPrice) || !isValidPrice(steamPrice)) {
+                            setCardPriceError(
+                                targetLinkElement,
+                                totalCard,
+                                !isValidPrice(lisPrice) ? 'Ошибка цены LIS' : 'Ошибка цены Steam'
+                            );
+                            if (onComplete) onComplete('invalid-price');
+                            return;
                         }
+
+                        const calculatedProfit = calculateNetProfit(steamPrice, lisPrice);
+                        totalCard.setAttribute('data-calculated-profit', calculatedProfit);
+                        setSteamBreakdown(targetLinkElement, breakdownRows);
+                        applyProfitBadgeColor(targetLinkElement, calculatedProfit);
+
+                        // Кэшируем только исходные данные Steam. Прибыль и детализация
+                        // зависят от цены конкретной карточки LIS и рассчитываются отдельно.
+                        if (onComplete) onComplete(200, {
+                            status: 'price',
+                            priceText,
+                            ordersCount,
+                            steamOrderRows
+                        });
                     }
 
-                    if (!priceFound) {
-                        targetLinkElement.innerText = "Нет заявок";
-                        targetLinkElement.style.background = '#607d8b';
-
-                        // Если заявок нет, явно ставим низкий приоритет для сортировки
-                        totalCard.setAttribute('data-calculated-profit', -999999);
-                        if (onComplete) onComplete(200, null);
+                    if (!priceFound && hasExplicitNoBuyOrdersMessage(doc)) {
+                        setCardNoBuyOrders(targetLinkElement, totalCard);
+                        if (onComplete) onComplete(200, { status: 'no-orders' });
 
                         //console.Error(htmlText);
+                    } else if (!priceFound) {
+                        console.error(`[Profit Calculator Parser Error] Не удалось распознать данные Steam для "${marketHashName}"`);
+                        targetLinkElement.innerText = "Ошибка ответа Steam";
+                        targetLinkElement.style.background = '#f04747';
+                        totalCard.setAttribute('data-calculated-profit', -999999);
+                        if (onComplete) onComplete('parser-error');
                     }
                 } catch (e) {
                     console.error(`[Profit Calculator Error] Сбой обработки DOM для "${marketHashName}":`, e);
@@ -817,6 +1117,17 @@
                 totalCard.setAttribute('data-calculated-profit', -999999);
                 if (onComplete) onComplete('error');
             },
+            ontimeout: function() {
+                if (!isOperationActive(operation)) {
+                    if (onComplete) onComplete('cancelled');
+                    return;
+                }
+                console.error(`[Profit Calculator Timeout] Steam не ответил за ${STEAM_REQUEST_TIMEOUT_MS / 1000}с для "${marketHashName}"`);
+                targetLinkElement.innerText = "Таймаут Steam";
+                targetLinkElement.style.background = '#f04747';
+                totalCard.setAttribute('data-calculated-profit', -999999);
+                if (onComplete) onComplete('timeout');
+            },
             onabort: function() {
                 if (onComplete) onComplete('cancelled');
             }
@@ -827,8 +1138,11 @@
 
     // Вспомогательная функция для расчета чистой выгоды (Цена Steam - Цена LIS-SKINS)
     function formatPriceWithProfit(steamPriceRaw, targetLinkElement, ordersCount = '') {
-        const steamPrice = parseFloat(steamPriceRaw.replace(/[^0-9.,]/g, '').replace(',', '.'));
+        const steamPrice = parsePriceValue(steamPriceRaw);
         const lisPrice = parseFloat(targetLinkElement.getAttribute('data-lis-price')) || 0;
+
+        if (!isValidPrice(steamPrice)) return 'Ошибка цены Steam';
+        if (!isValidPrice(lisPrice)) return 'Ошибка цены LIS';
 
         // Формируем базовую строку цены и добавляем количество сделок (ордеров), если оно передано
         const ordersText = ordersCount ? ` [${ordersCount} шт.]` : '';
@@ -886,8 +1200,8 @@
             .replace(/'/g, '&#039;');
     }
 
-    function getSteamBreakdownRows(table, lisPrice) {
-        if (!table || lisPrice <= 0) return [];
+    function getSteamOrderRows(table) {
+        if (!table) return [];
 
         return Array.from(table.querySelectorAll('tbody tr')).slice(0, getTooltipRowsCount()).map(row => {
             const cells = row.querySelectorAll('td');
@@ -895,14 +1209,26 @@
             const salePrice = parsePriceValue(salePriceText);
             const lotsCount = cells[1]?.textContent.trim().replace(/\s| /g, '') || '';
 
-            if (!Number.isFinite(salePrice)) return null;
+            if (!isValidPrice(salePrice)) return null;
 
             return {
                 salePriceText,
                 lotsCount,
-                ...calculateSteamSale(salePrice, lisPrice)
+                salePrice
             };
         }).filter(Boolean);
+    }
+
+    function calculateSteamBreakdownRows(steamOrderRows, lisPrice) {
+        if (!Array.isArray(steamOrderRows) || lisPrice <= 0) return [];
+
+        return steamOrderRows
+            .filter(row => isValidPrice(row.salePrice))
+            .map(row => ({
+                salePriceText: row.salePriceText,
+                lotsCount: row.lotsCount,
+                ...calculateSteamSale(row.salePrice, lisPrice)
+            }));
     }
 
     function setSteamBreakdown(badge, rows = []) {
@@ -1038,7 +1364,7 @@
     }
 
     function getProfitPercentFromCard(card) {
-        const badge = card.querySelector('.steam-highest-buy-order-link');
+        const badge = card.querySelector('.steam-highest-buy-order-link[data-lis-helper-badge="true"]');
         if (!badge) return null;
 
         const profit = getValidProfit(card);
@@ -1049,10 +1375,14 @@
         const PROFITABLE_PERCENT_THRESHOLD = 20;
         const profitPercent = getProfitPercentFromBadge(badge, profit);
 
-        if (badge.innerText === 'Пауза 429...') {
+        if (badge.innerText === 'Загрузка...') {
+            badge.style.background = '#7c5ce7';
+        } else if (badge.innerText.startsWith('Пауза 429')) {
             badge.style.background = '#7289da';
         } else if (badge.innerText === 'Нет заявок') {
             badge.style.background = '#607d8b';
+        } else if (badge.innerText.startsWith('Ошибка')) {
+            badge.style.background = '#f04747';
         } else if (profit !== null && profit < 0) {
             badge.style.background = '#f04747';
         } else if (profitPercent !== null && profitPercent > PROFITABLE_PERCENT_THRESHOLD) {
@@ -1064,7 +1394,7 @@
 
     function updateProfitBadgeColors(cardsArray) {
         cardsArray.forEach(card => {
-            const badge = card.querySelector('.steam-highest-buy-order-link');
+            const badge = card.querySelector('.steam-highest-buy-order-link[data-lis-helper-badge="true"]');
             if (!badge) return;
 
             const profit = getValidProfit(card);
@@ -1073,12 +1403,12 @@
     }
 
     // Функция сортировки карточек по значению выгоды (от большего к меньшему)
-    function sortCardsByProfit() {
+    function sortCardsByProfit(updateStatus = true) {
         const gridContainer = document.querySelector('.skins-market-skins-list');
         const statusDiv = document.getElementById('combine-status');
         if (!gridContainer) return;
 
-        if (statusDiv) statusDiv.innerText = "Сортировка по выгоде...";
+        if (updateStatus && statusDiv) statusDiv.innerText = "Сортировка по выгоде...";
 
         // Получаем массив всех карточек
         const cardsArray = Array.from(gridContainer.querySelectorAll('.skins-market-skins-list > .item'));
@@ -1095,7 +1425,7 @@
         cardsArray.forEach(card => gridContainer.appendChild(card));
         updateProfitBadgeColors(cardsArray);
 
-        if (statusDiv) statusDiv.innerText = "Готово! Отсортировано.";
+        if (updateStatus && statusDiv) statusDiv.innerText = "Готово! Отсортировано.";
     }
 
     function applyDiffFilter(operation) {
@@ -1125,16 +1455,18 @@
 
             if (passesDiffFilter) {
                 totalCard.style.display = '';
-                if (!totalCard.querySelector('.steam-highest-buy-order-link')) {
+                if (!totalCard.querySelector('.steam-highest-buy-order-link[data-lis-helper-badge="true"]')) {
                     let itemName = getMarketHashNameFromCard(totalCard);
 
                     if (itemName) {
                         const steamLink = document.createElement('a');
                         steamLink.className = 'steam-highest-buy-order-link';
+                        steamLink.setAttribute('data-lis-helper-badge', 'true');
                         steamLink.target = '_blank';
                         steamLink.style = `
                         position: absolute; top: 32px; left: 10px; right: 10px; z-index: 30;
-                        background: #ff9800; color: #fff !important; padding: 3px 8px;
+                        background: #7c5ce7; color: #fff !important; padding: 3px 8px;
+                        font-family: Arial, "Helvetica Neue", sans-serif;
                         font-size: 11px; font-weight: bold; border-radius: 4px;
                         text-decoration: none !important; box-shadow: 0 2px 5px rgba(0,0,0,0.3);
                         display: block; box-sizing: border-box; line-height: 1.25;
@@ -1148,6 +1480,12 @@
                         const lisPrice = lisPriceElem ? parseFloat(lisPriceElem.innerText.replace(/[^0-9.,]/g, '').replace(',', '.')) : 0;
                         steamLink.setAttribute('data-lis-price', lisPrice);
 
+                        if (!isValidPrice(lisPrice)) {
+                            setCardPriceError(steamLink, totalCard, 'Ошибка цены LIS');
+                            totalCard.appendChild(steamLink);
+                            return;
+                        }
+
                         const targetSteamUrl = `https://steamcommunity.com/market/listings/${currentAppId}/${encodeSteamMarketHashName(itemName)}`;
                         steamLink.setAttribute('href', targetSteamUrl);
                         totalCard.appendChild(steamLink);
@@ -1155,6 +1493,7 @@
                         // Добавляем задачу в очередь запросов
                         steamRequestsQueue.push({
                             targetUrl: targetSteamUrl,
+                            appId: currentAppId,
                             marketHashName: itemName,
                             targetLinkElement: steamLink,
                             totalCard: totalCard
@@ -1182,6 +1521,7 @@
         const statusDiv = document.getElementById('combine-status');
 
         setStartButtonLoading(true);
+        resetAnalysisResults();
 
         let pagesCount = parseInt(document.getElementById('pages-num-input').value) || 1;
 
@@ -1199,9 +1539,6 @@
             return;
         }
 
-        document.querySelectorAll('.item.loaded-by-script').forEach(el => el.remove());
-        document.querySelectorAll('.skins-market-skins-list > .item').forEach(card => card.style.display = '');
-
         const baseUrl = window.location.origin + window.location.pathname;
         const searchParams = new URLSearchParams(window.location.search);
 
@@ -1212,9 +1549,17 @@
             statusDiv.innerText = `Загрузка страницы ${p}/${pagesCount}, осталось ${pagesCount - p}`;
 
             let cleanup = null;
+            let requestTimedOut = false;
             try {
                 const controller = new AbortController();
-                cleanup = () => controller.abort();
+                const timeoutId = setTimeout(() => {
+                    requestTimedOut = true;
+                    controller.abort();
+                }, LIS_PAGE_REQUEST_TIMEOUT_MS);
+                cleanup = () => {
+                    clearTimeout(timeoutId);
+                    controller.abort();
+                };
                 operation.cleanups.add(cleanup);
 
                 const response = await fetch(targetUrl, { signal: controller.signal });
@@ -1222,6 +1567,7 @@
 
                 if (!response.ok) throw new Error();
                 const htmlText = await response.text();
+                clearTimeout(timeoutId);
                 operation.cleanups.delete(cleanup);
                 if (!isOperationActive(operation)) return;
 
@@ -1238,8 +1584,19 @@
                 });
                 if (addedInThisPage === 0) break;
             } catch (err) {
-                if (cleanup) operation.cleanups.delete(cleanup);
+                if (cleanup) {
+                    cleanup();
+                    operation.cleanups.delete(cleanup);
+                }
                 if (!isOperationActive(operation)) return;
+
+                if (requestTimedOut) {
+                    showErrorToast(`Страница ${p} LIS не ответила за ${LIS_PAGE_REQUEST_TIMEOUT_MS / 1000} секунд.`);
+                    statusDiv.innerText = `Таймаут при загрузке страницы ${p}. Обрабатываем уже загруженные.`;
+                } else {
+                    showErrorToast(`Не удалось загрузить страницу ${p} LIS.`);
+                    statusDiv.innerText = `Ошибка загрузки страницы ${p}. Обрабатываем уже загруженные.`;
+                }
                 break;
             }
         }
@@ -1259,13 +1616,10 @@
         }
     }
 
-    const observer = new MutationObserver((mutations, obs) => {
-        if (document.body && !panelInjected) {
+    const observer = new MutationObserver(() => {
+        if (!document.getElementById('lis-helper-panel')) {
+            panelInjected = false;
             injectPanel();
-            if (panelInjected) {
-                // ОПТИМИЗАЦИЯ: Отключаем observer, так как панель уже создана
-                obs.disconnect();
-            }
         }
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
