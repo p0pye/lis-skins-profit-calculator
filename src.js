@@ -1430,7 +1430,7 @@
                     <tr>
                         <th>Покупка</th>
                         <th>Продажа</th>
-                        <th>Лоты</th>
+                        <th>Заявки</th>
                         <th>Без комиссии</th>
                         <th>Комиссия</th>
                         <th>К получению</th>
@@ -1564,7 +1564,7 @@
             if (!badge) return;
 
             const badgeText = badge.innerText || '';
-            if (badgeText === 'Нет заявок' || badgeText === 'Нет лотов') {
+            if (badgeText === 'Нет заявок') {
                 stats.noOrders++;
                 return;
             }
@@ -1583,7 +1583,7 @@
     }
 
     function formatResultStats(stats = getResultStats()) {
-        return `Готово: ${stats.total} карточек, выгодных ${stats.profitable}, ошибок ${stats.errors}, без лотов ${stats.noOrders}`;
+        return `Готово: ${stats.total} карточек, выгодных ${stats.profitable}, ошибок ${stats.errors}, без заявок ${stats.noOrders}`;
     }
 
     function applyProfitBadgeColor(badge, profit) {
@@ -1593,7 +1593,7 @@
             badge.style.background = COLOR_LOADING;
         } else if (badge.innerText.startsWith('Пауза Steam')) {
             badge.style.background = COLOR_PAUSED;
-        } else if (badge.innerText === 'Нет заявок' || badge.innerText === 'Нет лотов') {
+        } else if (badge.innerText === 'Нет заявок') {
             badge.style.background = COLOR_NO_ORDERS;
         } else if (isErrorBadgeText(badge.innerText || '')) {
             badge.style.background = PROFIT_COLOR_NEGATIVE;
