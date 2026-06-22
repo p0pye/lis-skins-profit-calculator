@@ -294,13 +294,6 @@
         setSteamBreakdown(targetLinkElement);
     }
 
-    function setCardNoSteamLots(targetLinkElement, totalCard) {
-        targetLinkElement.innerText = 'Нет лотов';
-        targetLinkElement.style.background = COLOR_NO_ORDERS;
-        totalCard.setAttribute('data-calculated-profit', -999999);
-        setSteamBreakdown(targetLinkElement);
-    }
-
     function getSteamCacheKey(appId, marketHashName) {
         return `${appId}:${marketHashName}`;
     }
@@ -363,31 +356,6 @@
         ];
 
         return noOrdersMessages.some(message => pageText.includes(message));
-    }
-
-    function hasExplicitNoLotsMessage(doc) {
-        const pageText = normalizeItemName(doc.body?.textContent || '').toLowerCase();
-        const noLotsMessages = [
-            'нет активных лотов',
-            'нет лотов',
-            'лотов нет',
-            'нет предложений о продаже',
-            'предмет недоступен',
-            'запрашиваемый предмет, возможно, не существует',
-            'не удалось загрузить этот контент',
-            'не удалось найти этот предмет',
-            'failed to load item description',
-            'there was an error loading item data',
-            'the item specified was not found',
-            'there are no listings',
-            'there are currently no listings',
-            'no listings',
-            'item not found',
-            'item may not exist',
-            'this item is unavailable'
-        ];
-
-        return noLotsMessages.some(message => pageText.includes(message));
     }
 
     function findBuyOrdersTable(labelElement) {
@@ -509,11 +477,6 @@
                 if (cached) {
                     if (cached.status === 'no-orders') {
                         setCardNoBuyOrders(task.targetLinkElement, task.totalCard);
-                        completeSteamTask(operation);
-                        continue;
-                    }
-                    if (cached.status === 'no-lots') {
-                        setCardNoSteamLots(task.targetLinkElement, task.totalCard);
                         completeSteamTask(operation);
                         continue;
                     }
@@ -1191,9 +1154,6 @@
                     if (!priceFound && hasExplicitNoBuyOrdersMessage(doc)) {
                         setCardNoBuyOrders(targetLinkElement, totalCard);
                         if (onComplete) onComplete(200, { status: 'no-orders' });
-                    } else if (!priceFound && hasExplicitNoLotsMessage(doc)) {
-                        setCardNoSteamLots(targetLinkElement, totalCard);
-                        if (onComplete) onComplete(200, { status: 'no-lots' });
                     } else if (!priceFound) {
                         console.error(`[Profit Calculator Parser Error] Не удалось распознать данные Steam для "${marketHashName}"`);
                         targetLinkElement.innerText = "Ответ Steam не распознан";
