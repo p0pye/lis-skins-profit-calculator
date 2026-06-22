@@ -15,16 +15,45 @@
     'use strict';
 
     let panelInjected = false;
-    let steamRequestsQueue = []; // Массив для хранения очереди задач
+    let steamRequestsQueue = [];
     const steamCache = new Map();
-    let isQueueRunning = false; // Флаг, запущен ли процесс обработки
+    let isQueueRunning = false;
     let currentOperation = null;
     let operationId = 0;
-    const STEAM_SELLER_MULTIPLIER = 1.15;
+    const STEAM_FEE_RATE = 0.05;
+    const STEAM_GAME_FEE_RATE = 0.10;
     const STEAM_REQUEST_TIMEOUT_MS = 20000;
     const LIS_PAGE_REQUEST_TIMEOUT_MS = 20000;
     const MAX_STEAM_429_REQUEUES = 10;
     const STEAM_CACHE_TTL_MS = 5 * 60 * 1000;
+    const MAX_STEAM_TOOLTIP_ROWS = 10;
+    const EXCELLENT_PROFIT_PERCENT_THRESHOLD = 30;
+    const PROFITABLE_PERCENT_THRESHOLD = 20;
+    const PROFIT_COLOR_EXCELLENT = '#16a34a';
+    const PROFIT_COLOR_POSITIVE = '#10b981';
+    const PROFIT_COLOR_NEUTRAL = '#f59e0b';
+    const PROFIT_COLOR_NEGATIVE = '#dc2626';
+    const COLOR_LOADING = '#2563eb';
+    const COLOR_PAUSED = '#7c3aed';
+    const COLOR_NO_ORDERS = '#64748b';
+    const COLOR_TEXT = '#fff';
+    const COLOR_PANEL_BG = '#111827';
+    const COLOR_PANEL_FIELD_BG = '#1f2937';
+    const COLOR_PANEL_HOVER = '#334155';
+    const COLOR_PANEL_BORDER = '#475569';
+    const COLOR_PANEL_ACCENT = '#38bdf8';
+    const COLOR_PANEL_SECONDARY_ACCENT = '#a78bfa';
+    const COLOR_PANEL_SUCCESS_ACCENT = '#22c55e';
+    const COLOR_PANEL_STATUS = '#cbd5e1';
+    const COLOR_TOOLTIP_BG = '#0f172a';
+    const COLOR_ERROR_DARK = '#991b1b';
+    const COLOR_SUCCESS_DARK = '#166534';
+    const COLOR_SPINNER_TRACK = 'rgba(255,255,255,0.3)';
+    const COLOR_SHADOW = 'rgba(0,0,0,0.5)';
+    const COLOR_PANEL_SHADOW = 'rgba(0,0,0,0.8)';
+    const COLOR_HELP_SHADOW = 'rgba(0,0,0,0.45)';
+    const COLOR_TOOLTIP_SHADOW = 'rgba(0,0,0,0.55)';
+    const COLOR_BADGE_SHADOW = 'rgba(0,0,0,0.3)';
 
     function createOperation() {
         currentOperation = {
@@ -124,7 +153,7 @@
         });
     }
 
-    function updateSteamProgress(operation, prefix = 'Загрузка цен Steam') {
+    function updateSteamProgress(operation, prefix = 'Steam') {
         if (!isOperationActive(operation) || !operation.steamProgress) return;
 
         const statusDiv = document.getElementById('combine-status');
@@ -134,7 +163,10 @@
         const completed = operation.steamProgress.completed;
         const current = Math.min(completed + 1, total);
         const remaining = Math.max(total - completed, 0);
-        const elapsedMs = Date.now() - operation.steamProgress.startedAt;
+        const activePauseMs = operation.steamProgress.pauseStartedAt
+            ? Date.now() - operation.steamProgress.pauseStartedAt
+            : 0;
+        const elapsedMs = Math.max(Date.now() - operation.steamProgress.startedAt - operation.steamProgress.pausedMs - activePauseMs, 0);
         const etaText = completed > 0 && remaining > 0
             ? `, примерно ${formatDuration((elapsedMs / completed) * remaining)}`
             : '';
@@ -157,8 +189,26 @@
         const minutes = Math.floor(totalSeconds / 60);
         const seconds = totalSeconds % 60;
 
-        if (minutes <= 0) return `${seconds}с`;
-        return `${minutes}м ${seconds.toString().padStart(2, '0')}с`;
+        if (minutes <= 0) return `${seconds} сек`;
+        return `${minutes} мин ${seconds} сек`;
+    }
+
+    function updateLisProgress(operation) {
+        if (!isOperationActive(operation) || !operation.lisProgress) return;
+
+        const statusDiv = document.getElementById('combine-status');
+        if (!statusDiv) return;
+
+        const total = operation.lisProgress.total;
+        const completed = operation.lisProgress.completed;
+        const currentPage = Math.min(completed + 2, operation.lisProgress.pagesCount);
+        const remaining = Math.max(total - completed, 0);
+        const elapsedMs = Date.now() - operation.lisProgress.startedAt;
+        const etaText = completed > 0 && remaining > 0
+            ? `, примерно ${formatDuration((elapsedMs / completed) * remaining)}`
+            : '';
+
+        statusDiv.innerText = `LIS: ${currentPage}/${operation.lisProgress.pagesCount}, осталось ${remaining}${etaText}`;
     }
 
     function pauseSteamGlobally(operation) {
@@ -166,9 +216,16 @@
 
         operation.steamRetryCount++;
         const retryDelay = 60000 + ((operation.steamRetryCount - 1) * 30000);
+        const pauseStartedAt = Date.now();
+        if (operation.steamProgress) operation.steamProgress.pauseStartedAt = pauseStartedAt;
+
         operation.steamPausePromise = waitForOperation(operation, retryDelay, (secondsLeft) => {
-            updateSteamProgress(operation, `Steam Блок 429! Ретрай через ${secondsLeft}с. Цены Steam`);
+            updateSteamProgress(operation, `Steam ограничил запросы. Повтор через ${secondsLeft} сек`);
         }).finally(() => {
+            if (operation.steamProgress?.pauseStartedAt === pauseStartedAt) {
+                operation.steamProgress.pausedMs += Date.now() - pauseStartedAt;
+                operation.steamProgress.pauseStartedAt = null;
+            }
             if (currentOperation === operation) operation.steamPausePromise = null;
         });
 
@@ -203,20 +260,43 @@
         return (value || '').replace(/\s+/g, ' ').trim();
     }
 
+    function normalizeSteamMarketHashName(marketHashName, appId) {
+        let normalized = normalizeItemName(marketHashName);
+        if (appId !== 730) return normalized;
+
+        normalized = normalized.replace(
+            /\b(Gamma Doppler)\s+(Emerald|Phase\s*[1-4])(?=\s*(?:\(|$))/i,
+            '$1'
+        );
+        normalized = normalized.replace(
+            /\b(Doppler)\s+(Ruby|Sapphire|Black Pearl|Phase\s*[1-4])(?=\s*(?:\(|$))/i,
+            '$1'
+        );
+
+        return normalizeItemName(normalized);
+    }
+
     function isValidPrice(value) {
         return Number.isFinite(value) && value > 0;
     }
 
     function setCardPriceError(targetLinkElement, totalCard, message) {
         targetLinkElement.innerText = message;
-        targetLinkElement.style.background = '#f04747';
+        targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
         totalCard.setAttribute('data-calculated-profit', -999999);
         setSteamBreakdown(targetLinkElement);
     }
 
     function setCardNoBuyOrders(targetLinkElement, totalCard) {
         targetLinkElement.innerText = 'Нет заявок';
-        targetLinkElement.style.background = '#607d8b';
+        targetLinkElement.style.background = COLOR_NO_ORDERS;
+        totalCard.setAttribute('data-calculated-profit', -999999);
+        setSteamBreakdown(targetLinkElement);
+    }
+
+    function setCardNoSteamLots(targetLinkElement, totalCard) {
+        targetLinkElement.innerText = 'Нет лотов';
+        targetLinkElement.style.background = COLOR_NO_ORDERS;
         totalCard.setAttribute('data-calculated-profit', -999999);
         setSteamBreakdown(targetLinkElement);
     }
@@ -283,6 +363,31 @@
         ];
 
         return noOrdersMessages.some(message => pageText.includes(message));
+    }
+
+    function hasExplicitNoLotsMessage(doc) {
+        const pageText = normalizeItemName(doc.body?.textContent || '').toLowerCase();
+        const noLotsMessages = [
+            'нет активных лотов',
+            'нет лотов',
+            'лотов нет',
+            'нет предложений о продаже',
+            'предмет недоступен',
+            'запрашиваемый предмет, возможно, не существует',
+            'не удалось загрузить этот контент',
+            'не удалось найти этот предмет',
+            'failed to load item description',
+            'there was an error loading item data',
+            'the item specified was not found',
+            'there are no listings',
+            'there are currently no listings',
+            'no listings',
+            'item not found',
+            'item may not exist',
+            'this item is unavailable'
+        ];
+
+        return noLotsMessages.some(message => pageText.includes(message));
     }
 
     function findBuyOrdersTable(labelElement) {
@@ -375,18 +480,19 @@
     }
 
     async function processNextSteamRequest(operation) {
-        if (isQueueRunning) return; // Предотвращаем повторный множественный запуск менеджера
+        if (isQueueRunning) return;
         isQueueRunning = true;
 
-        const concurrency = getWorkersCount(); // Количество одновременных запросов к Steam
+        const concurrency = getWorkersCount();
         operation.steamProgress = {
             total: steamRequestsQueue.length,
             completed: 0,
-            startedAt: Date.now()
+            startedAt: Date.now(),
+            pausedMs: 0,
+            pauseStartedAt: null
         };
         updateSteamProgress(operation);
 
-        // Функция-воркер, которая берет задачи из общей очереди
         const worker = async () => {
             while (steamRequestsQueue.length > 0 && isOperationActive(operation)) {
                 if (operation.steamPausePromise) {
@@ -398,12 +504,16 @@
                 if (!task) continue;
                 updateSteamProgress(operation);
 
-                // ШАГ 1: Проверка кэша. Если этот скин уже загружали — берем данные мгновенно
                 const cacheKey = getSteamCacheKey(task.appId, task.marketHashName);
                 const cached = getFreshSteamCache(cacheKey);
                 if (cached) {
                     if (cached.status === 'no-orders') {
                         setCardNoBuyOrders(task.targetLinkElement, task.totalCard);
+                        completeSteamTask(operation);
+                        continue;
+                    }
+                    if (cached.status === 'no-lots') {
+                        setCardNoSteamLots(task.targetLinkElement, task.totalCard);
                         completeSteamTask(operation);
                         continue;
                     }
@@ -434,8 +544,7 @@
                     continue;
                 }
 
-                // ШАГ 2: Если в кэше нет — отправляем сетевой запрос
-                task.targetLinkElement.innerText = 'Загрузка...';
+                task.targetLinkElement.innerText = 'Загружаю';
 
                 await new Promise((resolve) => {
                     let completed = false;
@@ -454,27 +563,25 @@
 
                             if (task.retry429Count <= MAX_STEAM_429_REQUEUES) {
                                 steamRequestsQueue.unshift(task);
-                                task.targetLinkElement.innerText = `Пауза 429 (${task.retry429Count}/${MAX_STEAM_429_REQUEUES})`;
-                                task.targetLinkElement.style.background = '#7289da';
+                                task.targetLinkElement.innerText = `Пауза Steam ${task.retry429Count}/${MAX_STEAM_429_REQUEUES}`;
+                                task.targetLinkElement.style.background = COLOR_PAUSED;
                                 sortCardsByProfit();
                                 await pauseSteamGlobally(operation);
                             } else {
                                 console.error(`[Profit Calculator Error] Достигнут лимит повторов 429 для "${task.marketHashName}"`);
-                                task.targetLinkElement.innerText = 'Лимит 429 исчерпан';
-                                task.targetLinkElement.style.background = '#f04747';
+                                task.targetLinkElement.innerText = 'Лимит повторов';
+                                task.targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
                                 task.totalCard.setAttribute('data-calculated-profit', -999999);
                                 completeSteamTask(operation);
                             }
                             resolve();
                         } else {
-                            // Сохраняем успешный результат в кэш, чтобы не запрашивать повторно дубликаты
                             if (status === 200 && data) {
                                 steamCache.set(cacheKey, {
                                     ...data,
                                     fetchedAt: Date.now()
                                 });
                             }
-                            // Безопасная, но ускоренная пауза между запросами в одном потоке (1.2 - 2 секунды)
                             const delay = 1200 + Math.random() * 800;
                             await waitForOperation(operation, delay);
                             completeSteamTask(operation);
@@ -494,23 +601,18 @@
             }
         };
 
-        // Запускаем параллельных воркера из одного пула задач
         const workers = Array(concurrency).fill(null).map(() => worker());
-        // Ждем, пока абсолютно все воркеры закончат работу с пулом задач
         await Promise.all(workers);
 
         if (!isOperationActive(operation)) return;
 
-        // Железно вызываем сортировку один раз, когда всё гарантированно готово
         sortCardsByProfit();
+        const summary = formatResultStats();
+        showSuccessToast(summary);
 
-        // Выводим всплывающее уведомление об успешном окончании
-        showSuccessToast('Обработка завершена!');
-
-        finishOperation(operation);
+        finishOperation(operation, summary);
     }
 
-    // Функция вывода всплывающих уведомлений об ошибках (исчезает через 10 сек)
     function showErrorToast(message) {
         let container = document.getElementById('lis-error-toast-container');
         if (!container) {
@@ -522,23 +624,22 @@
 
         const toast = document.createElement('div');
         toast.style = `
-            background: #f04747; color: #fff; padding: 12px 18px; border-radius: 6px;
+            background: ${PROFIT_COLOR_NEGATIVE}; color: ${COLOR_TEXT}; padding: 12px 18px; border-radius: 6px;
             font-family: sans-serif; font-size: 13px; font-weight: bold;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.5); border-left: 5px solid #bd362f;
+            box-shadow: 0 4px 12px ${COLOR_SHADOW}; border-left: 5px solid ${COLOR_ERROR_DARK};
             opacity: 1; transition: opacity 0.5s ease-in-out; min-width: 250px;
         `;
-        toast.innerText = `⚠️ Profit Calculator ${message}`;
+        toast.innerText = `⚠️ Profit-Calculator: ${message}`;
         container.appendChild(toast);
 
         setTimeout(() => {
             toast.style.opacity = '0';
-            // ОПТИМИЗАЦИЯ: Удаление элемента строго по окончании CSS-анимации
             toast.addEventListener('transitionend', () => toast.remove(), { once: true });
         }, 10000);
     }
-    // Всплывающее уведомление об успешном завершении (зеленое, исчезает через 5 секунд)
+
     function showSuccessToast(message) {
-        let container = document.getElementById('lis-error-toast-container'); // Используем тот же контейнер
+        let container = document.getElementById('lis-error-toast-container');
         if (!container) {
             container = document.createElement('div');
             container.id = 'lis-error-toast-container';
@@ -548,12 +649,12 @@
 
         const toast = document.createElement('div');
         toast.style = `
-            background: #43b581; color: #fff; padding: 12px 18px; border-radius: 6px;
+            background: ${PROFIT_COLOR_EXCELLENT}; color: ${COLOR_TEXT}; padding: 12px 18px; border-radius: 6px;
             font-family: sans-serif; font-size: 13px; font-weight: bold;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.5); border-left: 5px solid #2e8b57;
+            box-shadow: 0 4px 12px ${COLOR_SHADOW}; border-left: 5px solid ${COLOR_SUCCESS_DARK};
             opacity: 1; transition: opacity 0.5s ease-in-out; min-width: 250px;
         `;
-        toast.innerHTML = `✅ Profit Calculator: ${message}`;
+        toast.innerHTML = `✅ Profit-Calculator: ${message}`;
         container.appendChild(toast);
 
         setTimeout(() => {
@@ -562,7 +663,6 @@
         }, 5000);
     }
 
-    // Инициализация и отрисовка боковой панели управления
     function shouldInjectPanel() {
         return Boolean(document.querySelector('.skins-market-skins-list > .item'));
     }
@@ -584,9 +684,9 @@
                 display: inline-block;
                 width: 12px;
                 height: 12px;
-                border: 2px solid rgba(255,255,255,0.3);
+                border: 2px solid ${COLOR_SPINNER_TRACK};
                 border-radius: 50%;
-                border-top-color: #fff;
+                border-top-color: ${COLOR_TEXT};
                 animation: lis-spin 1s ease-in-out infinite;
                 margin-right: 6px;
                 vertical-align: middle;
@@ -594,10 +694,10 @@
             .lis-btn-disabled {
                 opacity: 0.6 !important;
                 cursor: not-allowed !important;
-                background: #4f545c !important;
+                background: ${COLOR_PANEL_BORDER} !important;
             }
             .lis-btn-cancel {
-                background: #f04747 !important;
+                background: ${PROFIT_COLOR_NEGATIVE} !important;
                 cursor: pointer !important;
             }
             .lis-panel-header {
@@ -609,7 +709,7 @@
             }
             .lis-panel-title {
                 flex: 1;
-                color: #ff9800;
+                color: ${COLOR_PANEL_ACCENT};
                 font-weight: bold;
                 text-align: center;
                 white-space: nowrap;
@@ -618,17 +718,17 @@
                 width: 24px;
                 height: 24px;
                 padding: 0;
-                border: 1px solid #4f545c;
+                border: 1px solid ${COLOR_PANEL_BORDER};
                 border-radius: 4px;
-                background: #36393e;
-                color: #fff;
+                background: ${COLOR_PANEL_FIELD_BG};
+                color: ${COLOR_TEXT};
                 cursor: pointer;
                 font-family: Arial, "Helvetica Neue", sans-serif;
                 font-size: 14px;
                 line-height: 22px;
             }
             .lis-panel-toggle:hover {
-                background: #4f545c;
+                background: ${COLOR_PANEL_HOVER};
             }
             #lis-helper-panel[data-collapsed="true"] {
                 left: 0 !important;
@@ -688,16 +788,16 @@
                 width: 18px;
                 height: 13px;
                 padding: 0;
-                border: 1px solid #4f545c;
+                border: 1px solid ${COLOR_PANEL_BORDER};
                 border-radius: 3px;
-                background: #36393e;
-                color: #fff;
+                background: ${COLOR_PANEL_FIELD_BG};
+                color: ${COLOR_TEXT};
                 cursor: pointer;
                 font-size: 8px;
                 line-height: 10px;
             }
             .lis-stepper:hover {
-                background: #4f545c;
+                background: ${COLOR_PANEL_HOVER};
             }
             .lis-help {
                 position: relative;
@@ -707,9 +807,9 @@
                 width: 14px;
                 height: 14px;
                 border-radius: 50%;
-                background: #36393e;
-                border: 1px solid #4f545c;
-                color: #fff;
+                background: ${COLOR_PANEL_FIELD_BG};
+                border: 1px solid ${COLOR_PANEL_BORDER};
+                color: ${COLOR_TEXT};
                 font-size: 10px;
                 font-weight: bold;
                 cursor: help;
@@ -724,24 +824,24 @@
                 width: 170px;
                 padding: 7px 9px;
                 border-radius: 5px;
-                background: #111318;
-                border: 1px solid #4f545c;
-                color: #fff;
+                background: ${COLOR_TOOLTIP_BG};
+                border: 1px solid ${COLOR_PANEL_BORDER};
+                color: ${COLOR_TEXT};
                 font-size: 12px;
                 font-weight: normal;
                 line-height: 1.3;
-                box-shadow: 0 4px 12px rgba(0,0,0,0.45);
+                box-shadow: 0 4px 12px ${COLOR_HELP_SHADOW};
                 z-index: 10000001;
                 pointer-events: none;
             }
             .lis-profit-tooltip {
                 position: fixed;
                 z-index: 10000000;
-                background: #1e2124;
-                color: #fff;
-                border: 1px solid #4f545c;
+                background: ${COLOR_PANEL_BG};
+                color: ${COLOR_TEXT};
+                border: 1px solid ${COLOR_PANEL_BORDER};
                 border-radius: 6px;
-                box-shadow: 0 6px 18px rgba(0,0,0,0.55);
+                box-shadow: 0 6px 18px ${COLOR_TOOLTIP_SHADOW};
                 padding: 8px;
                 font-family: Arial, "Helvetica Neue", sans-serif;
                 font-size: 11px;
@@ -757,13 +857,13 @@
             }
             .lis-profit-tooltip th,
             .lis-profit-tooltip td {
-                border: 1px solid #4f545c;
+                border: 1px solid ${COLOR_PANEL_BORDER};
                 padding: 4px 6px;
                 text-align: right;
                 overflow-wrap: anywhere;
             }
             .lis-profit-tooltip th {
-                color: #ff9800;
+                color: ${COLOR_PANEL_ACCENT};
                 font-weight: bold;
                 line-height: 1.2;
                 text-align: center;
@@ -771,13 +871,21 @@
             .lis-profit-tooltip td {
                 white-space: nowrap;
             }
-            .lis-profit-cell-positive {
-                background: #2e8b57;
-                color: #fff;
+            .lis-profit-cell-excellent {
+                background: ${PROFIT_COLOR_EXCELLENT};
+                color: ${COLOR_TEXT};
             }
-            .lis-profit-cell-negative {
-                background: #bd362f;
-                color: #fff;
+            .lis-profit-cell-good {
+                background: ${PROFIT_COLOR_POSITIVE};
+                color: ${COLOR_TEXT};
+            }
+            .lis-profit-cell-neutral {
+                background: ${PROFIT_COLOR_NEUTRAL};
+                color: ${COLOR_TEXT};
+            }
+            .lis-profit-cell-bad {
+                background: ${PROFIT_COLOR_NEGATIVE};
+                color: ${COLOR_TEXT};
             }
             `;
             document.head.appendChild(style);
@@ -794,9 +902,9 @@
         panel.setAttribute('data-collapsed', String(initiallyCollapsed));
         panel.style = `
             position: fixed; top: 140px; left: 8px; z-index: 9999999 !important;
-            background: #1e2124 !important; color: #fff !important; padding: 12px !important;
-            border-radius: 8px !important; border: 1px solid #36393e !important;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.8) !important; font-family: sans-serif !important;
+            background: ${COLOR_PANEL_BG} !important; color: ${COLOR_TEXT} !important; padding: 12px !important;
+            border-radius: 8px !important; border: 1px solid ${COLOR_PANEL_BORDER} !important;
+            box-shadow: 0 4px 15px ${COLOR_PANEL_SHADOW} !important; font-family: sans-serif !important;
             font-size: 13px !important; width: 210px !important; display: block !important;
         `;
 
@@ -808,10 +916,10 @@
 
             <div class="lis-panel-content">
             <div class="lis-setting-row">
-                <label>Мин. скидка (%):</label>
+                <label>Скидка, от %:</label>
                 <div class="lis-number-control">
                     <input type="number" id="diff-num-input" min="0" max="100" value="${savedDiff}" style="
-                        width: 50px; background: #2f3136; color: #ff9800; border: 1px solid #4f545c;
+                        width: 50px; background: ${COLOR_PANEL_FIELD_BG}; color: ${COLOR_PANEL_ACCENT}; border: 1px solid ${COLOR_PANEL_BORDER};
                         padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
                     ">
                     <div class="lis-stepper-buttons">
@@ -819,17 +927,17 @@
                         <button type="button" class="lis-stepper" data-step-target="diff-num-input" data-step-delta="-1">▼</button>
                     </div>
                 </div>
-                <span class="lis-help" data-tooltip="Показывать только карточки со скидкой не ниже этого процента.">?</span>
+                <span class="lis-help" data-tooltip="Минимальная скидка на LIS. При 0 показываются все карточки.">?</span>
             </div>
             <input type="range" id="min-diff-input" min="0" max="80" value="${Math.min(parseInt(savedDiff), 80)}" step="1" style="
-                width: 100%; margin-bottom: 15px; cursor: pointer; accent-color: #ff9800;
+                width: 100%; margin-bottom: 15px; cursor: pointer; accent-color: ${COLOR_PANEL_ACCENT};
             ">
 
             <div class="lis-setting-row">
-                <label>Страниц собрать:</label>
+                <label>Страниц LIS:</label>
                 <div class="lis-number-control">
                     <input type="number" id="pages-num-input" min="1" max="99" value="${savedPages}" style="
-                        width: 50px; background: #2f3136; color: #7289da; border: 1px solid #4f545c;
+                        width: 50px; background: ${COLOR_PANEL_FIELD_BG}; color: ${COLOR_PANEL_SECONDARY_ACCENT}; border: 1px solid ${COLOR_PANEL_BORDER};
                         padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
                     ">
                     <div class="lis-stepper-buttons">
@@ -837,17 +945,17 @@
                         <button type="button" class="lis-stepper" data-step-target="pages-num-input" data-step-delta="-1">▼</button>
                     </div>
                 </div>
-                <span class="lis-help" data-tooltip="Сколько страниц маркета загрузить перед фильтрацией.">?</span>
+                <span class="lis-help" data-tooltip="Сколько страниц LIS загрузить для поиска.">?</span>
             </div>
             <input type="range" id="pages-to-load" min="1" max="99" value="${savedPages}" style="
-                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: #7289da;
+                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${COLOR_PANEL_SECONDARY_ACCENT};
             ">
 
             <div class="lis-setting-row">
-                <label>Воркеров Steam:</label>
+                <label>Запросов Steam:</label>
                 <div class="lis-number-control">
                     <input type="number" id="workers-num-input" min="1" max="7" value="${Math.min(parseInt(savedWorkers), 7)}" style="
-                        width: 50px; background: #2f3136; color: #43b581; border: 1px solid #4f545c;
+                        width: 50px; background: ${COLOR_PANEL_FIELD_BG}; color: ${COLOR_PANEL_SUCCESS_ACCENT}; border: 1px solid ${COLOR_PANEL_BORDER};
                         padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
                     ">
                     <div class="lis-stepper-buttons">
@@ -855,17 +963,17 @@
                         <button type="button" class="lis-stepper" data-step-target="workers-num-input" data-step-delta="-1">▼</button>
                     </div>
                 </div>
-                <span class="lis-help" data-tooltip="Сколько запросов к Steam делать одновременно. Большое значение может вызвать временную блокировку.">?</span>
+                <span class="lis-help" data-tooltip="Сколько запросов к Steam делать одновременно. Высокое значение повышает риск блокировки.">?</span>
             </div>
             <input type="range" id="workers-to-load" min="1" max="7" value="${Math.min(parseInt(savedWorkers), 7)}" style="
-                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: #43b581;
+                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${COLOR_PANEL_SUCCESS_ACCENT};
             ">
 
             <div class="lis-setting-row">
-                <label>Лотов в подсказке:</label>
+                <label>Строк в таблице:</label>
                 <div class="lis-number-control">
                     <input type="number" id="tooltip-rows-num-input" min="1" max="10" value="${Math.min(parseInt(savedTooltipRows), 10)}" style="
-                        width: 50px; background: #2f3136; color: #ff9800; border: 1px solid #4f545c;
+                        width: 50px; background: ${COLOR_PANEL_FIELD_BG}; color: ${COLOR_PANEL_ACCENT}; border: 1px solid ${COLOR_PANEL_BORDER};
                         padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
                     ">
                     <div class="lis-stepper-buttons">
@@ -873,14 +981,14 @@
                         <button type="button" class="lis-stepper" data-step-target="tooltip-rows-num-input" data-step-delta="-1">▼</button>
                     </div>
                 </div>
-                <span class="lis-help" data-tooltip="Сколько строк Steam показать в таблице. Таблица появляется при наведении мышки на плашку цены.">?</span>
+                <span class="lis-help" data-tooltip="Сколько заявок Steam показывать в таблице при наведении на плашку.">?</span>
             </div>
             <input type="range" id="tooltip-rows-to-load" min="1" max="10" value="${Math.min(parseInt(savedTooltipRows), 10)}" style="
-                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: #ff9800;
+                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${COLOR_PANEL_ACCENT};
             ">
 
-            <button id="start-combine" style="width: 100%; background: #43b581; color: white; border: none; padding: 8px; border-radius: 4px; cursor: pointer; font-weight: bold;">Найти выгодные</button>
-            <div id="combine-status" style="margin-top: 8px; color: #aaa; font-size: 11px; text-align: center;"></div>
+            <button id="start-combine" style="width: 100%; background: ${PROFIT_COLOR_EXCELLENT}; color: ${COLOR_TEXT}; border: none; padding: 8px; border-radius: 4px; cursor: pointer; font-weight: bold;">Найти выгодные</button>
+            <div id="combine-status" style="margin-top: 8px; color: ${COLOR_PANEL_STATUS}; font-size: 11px; text-align: center;"></div>
             </div>
         `;
 
@@ -1004,7 +1112,6 @@
         }
     }
 
-    // Парсинг цены автовыкупа на основе реальной DOM-структуры страницы Steam
     function fetchSteamPriceFromHTML(targetUrl, marketHashName, targetLinkElement, totalCard, operation, onComplete) {
         const requestUrl = new URL(targetUrl);
         requestUrl.searchParams.set('l', 'russian');
@@ -1028,8 +1135,7 @@
                     console.error(`[Profit Calculator Error] Код ${response.status} для "${marketHashName}"`);
                     showErrorToast(`Steam заблокировал запрос (Код ${response.status}). Сделайте паузу.`);
                     targetLinkElement.innerText = `Блок ${response.status}`;
-                    targetLinkElement.style.background = '#f04747';
-                    // Передаем статус ошибки в колбэк, чтобы воркер корректно перешел к следующей задаче
+                    targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
                     if (onComplete) onComplete(response.status);
                     return;
                 }
@@ -1074,8 +1180,6 @@
                         setSteamBreakdown(targetLinkElement, breakdownRows);
                         applyProfitBadgeColor(targetLinkElement, calculatedProfit);
 
-                        // Кэшируем только исходные данные Steam. Прибыль и детализация
-                        // зависят от цены конкретной карточки LIS и рассчитываются отдельно.
                         if (onComplete) onComplete(200, {
                             status: 'price',
                             priceText,
@@ -1087,20 +1191,20 @@
                     if (!priceFound && hasExplicitNoBuyOrdersMessage(doc)) {
                         setCardNoBuyOrders(targetLinkElement, totalCard);
                         if (onComplete) onComplete(200, { status: 'no-orders' });
-
-                        //console.Error(htmlText);
+                    } else if (!priceFound && hasExplicitNoLotsMessage(doc)) {
+                        setCardNoSteamLots(targetLinkElement, totalCard);
+                        if (onComplete) onComplete(200, { status: 'no-lots' });
                     } else if (!priceFound) {
                         console.error(`[Profit Calculator Parser Error] Не удалось распознать данные Steam для "${marketHashName}"`);
-                        targetLinkElement.innerText = "Ошибка ответа Steam";
-                        targetLinkElement.style.background = '#f04747';
+                        targetLinkElement.innerText = "Ответ Steam не распознан";
+                        targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
                         totalCard.setAttribute('data-calculated-profit', -999999);
                         if (onComplete) onComplete('parser-error');
                     }
                 } catch (e) {
                     console.error(`[Profit Calculator Error] Сбой обработки DOM для "${marketHashName}":`, e);
-                    targetLinkElement.innerText = "Ошибка структуры";
-                    targetLinkElement.style.background = '#f04747';
-                    // При ошибке структуры также уводим карточку вниз
+                    targetLinkElement.innerText = "Страница Steam изменилась";
+                    targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
                     totalCard.setAttribute('data-calculated-profit', -999999);
                     if (onComplete) onComplete('error');
                 }
@@ -1112,8 +1216,8 @@
                     return;
                 }
                 console.error(`[Profit Calculator Network Error] Сбой сети для "${marketHashName}":`, err);
-                targetLinkElement.innerText = "Сбой сети";
-                targetLinkElement.style.background = '#f04747';
+                targetLinkElement.innerText = "Ошибка сети";
+                targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
                 totalCard.setAttribute('data-calculated-profit', -999999);
                 if (onComplete) onComplete('error');
             },
@@ -1123,8 +1227,8 @@
                     return;
                 }
                 console.error(`[Profit Calculator Timeout] Steam не ответил за ${STEAM_REQUEST_TIMEOUT_MS / 1000}с для "${marketHashName}"`);
-                targetLinkElement.innerText = "Таймаут Steam";
-                targetLinkElement.style.background = '#f04747';
+                targetLinkElement.innerText = "Steam не ответил";
+                targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
                 totalCard.setAttribute('data-calculated-profit', -999999);
                 if (onComplete) onComplete('timeout');
             },
@@ -1136,7 +1240,6 @@
         return request;
     }
 
-    // Вспомогательная функция для расчета чистой выгоды (Цена Steam - Цена LIS-SKINS)
     function formatPriceWithProfit(steamPriceRaw, targetLinkElement, ordersCount = '') {
         const steamPrice = parsePriceValue(steamPriceRaw);
         const lisPrice = parseFloat(targetLinkElement.getAttribute('data-lis-price')) || 0;
@@ -1144,7 +1247,6 @@
         if (!isValidPrice(steamPrice)) return 'Ошибка цены Steam';
         if (!isValidPrice(lisPrice)) return 'Ошибка цены LIS';
 
-        // Формируем базовую строку цены и добавляем количество сделок (ордеров), если оно передано
         const ordersText = ordersCount ? ` [${ordersCount} шт.]` : '';
         let resultText = `${formatCurrency(steamPrice)}${ordersText}`;
 
@@ -1158,20 +1260,98 @@
     }
 
     function parsePriceValue(text) {
-        return parseFloat((text || '').replace(/[^0-9.,]/g, '').replace(',', '.'));
+        let value = String(text || '')
+            .replace(/\s| /g, '')
+            .replace(/[^0-9.,-]/g, '')
+            .replace(/^[.,]+|[.,]+$/g, '');
+
+        if (!value) return NaN;
+
+        const lastDot = value.lastIndexOf('.');
+        const lastComma = value.lastIndexOf(',');
+
+        if (lastDot !== -1 && lastComma !== -1) {
+            const decimalSeparator = lastDot > lastComma ? '.' : ',';
+            const thousandsSeparator = decimalSeparator === '.' ? ',' : '.';
+
+            value = value
+                .replace(new RegExp(`\\${thousandsSeparator}`, 'g'), '')
+                .replace(decimalSeparator, '.');
+
+            return parseFloat(value);
+        }
+
+        const separator = lastDot !== -1 ? '.' : lastComma !== -1 ? ',' : '';
+        if (!separator) return parseFloat(value);
+
+        const separatorParts = value.split(separator);
+        const lastPart = separatorParts[separatorParts.length - 1];
+        const hasSeveralSeparators = separatorParts.length > 2;
+        const looksLikeThousandsOnly = lastPart.length === 3;
+
+        if (hasSeveralSeparators || looksLikeThousandsOnly) {
+            if (hasSeveralSeparators && !looksLikeThousandsOnly) {
+                const decimalPart = separatorParts.pop();
+                return parseFloat(`${separatorParts.join('')}.${decimalPart}`);
+            }
+
+            return parseFloat(separatorParts.join(''));
+        }
+
+        return parseFloat(value.replace(separator, '.'));
+    }
+
+    function toCents(value) {
+        return Math.round(value * 100);
+    }
+
+    function fromCents(value) {
+        return value / 100;
+    }
+
+    function calculateSteamFeeCents(sellerReceivesCents, feeRate) {
+        return Math.max(Math.floor(sellerReceivesCents * feeRate), 1);
+    }
+
+    function calculateSteamBuyerPaysCents(sellerReceivesCents) {
+        return sellerReceivesCents
+            + calculateSteamFeeCents(sellerReceivesCents, STEAM_FEE_RATE)
+            + calculateSteamFeeCents(sellerReceivesCents, STEAM_GAME_FEE_RATE);
+    }
+
+    function calculateSteamNetSaleCents(buyerPaysCents) {
+        let left = 0;
+        let right = Math.max(buyerPaysCents, 0);
+        let best = 0;
+
+        while (left <= right) {
+            const middle = Math.floor((left + right) / 2);
+            const calculatedBuyerPays = calculateSteamBuyerPaysCents(middle);
+
+            if (calculatedBuyerPays <= buyerPaysCents) {
+                best = middle;
+                left = middle + 1;
+            } else {
+                right = middle - 1;
+            }
+        }
+
+        return best;
     }
 
     function calculateSteamSale(steamPrice, lisPrice) {
-        const netSale = steamPrice / STEAM_SELLER_MULTIPLIER;
-        const commission = steamPrice - netSale;
+        const salePriceCents = toCents(steamPrice);
+        const lisPriceCents = toCents(lisPrice);
+        const netSaleCents = calculateSteamNetSaleCents(salePriceCents);
+        const commissionCents = salePriceCents - netSaleCents;
 
         return {
-            buyPrice: lisPrice,
-            salePrice: steamPrice,
-            grossProfit: steamPrice - lisPrice,
-            commission,
-            netSale,
-            netProfit: netSale - lisPrice
+            buyPrice: fromCents(lisPriceCents),
+            salePrice: fromCents(salePriceCents),
+            grossProfit: fromCents(salePriceCents - lisPriceCents),
+            commission: fromCents(commissionCents),
+            netSale: fromCents(netSaleCents),
+            netProfit: fromCents(netSaleCents - lisPriceCents)
         };
     }
 
@@ -1191,6 +1371,15 @@
         return `${sign}${formatCurrency(value)}`;
     }
 
+    function formatProfitPercent(profit, basePrice) {
+        if (basePrice <= 0 || profit === null) return '';
+
+        const profitPercent = (profit / basePrice) * 100;
+        const sign = profitPercent > 0 ? '+' : '';
+
+        return `${sign}${profitPercent.toFixed(2)}%`;
+    }
+
     function escapeHtml(value) {
         return String(value)
             .replace(/&/g, '&amp;')
@@ -1203,7 +1392,7 @@
     function getSteamOrderRows(table) {
         if (!table) return [];
 
-        return Array.from(table.querySelectorAll('tbody tr')).slice(0, getTooltipRowsCount()).map(row => {
+        return Array.from(table.querySelectorAll('tbody tr')).slice(0, MAX_STEAM_TOOLTIP_ROWS).map(row => {
             const cells = row.querySelectorAll('td');
             const salePriceText = cells[0]?.textContent.trim() || '';
             const salePrice = parsePriceValue(salePriceText);
@@ -1240,22 +1429,38 @@
         badge.setAttribute('data-steam-breakdown', JSON.stringify(rows));
     }
 
-    function getProfitCellClass(value) {
-        if (value > 0) return 'lis-profit-cell-positive';
-        if (value < 0) return 'lis-profit-cell-negative';
-        return '';
+    function getProfitState(profit, basePrice) {
+        if (profit !== null && profit < 0) return 'bad';
+
+        const profitPercent = basePrice > 0 && profit !== null ? (profit / basePrice) * 100 : null;
+        if (profitPercent !== null && profitPercent > EXCELLENT_PROFIT_PERCENT_THRESHOLD) return 'excellent';
+        if (profitPercent !== null && profitPercent >= PROFITABLE_PERCENT_THRESHOLD) return 'good';
+
+        return 'neutral';
+    }
+
+    function getProfitColorByState(state) {
+        if (state === 'excellent') return PROFIT_COLOR_EXCELLENT;
+        if (state === 'good') return PROFIT_COLOR_POSITIVE;
+        if (state === 'bad') return PROFIT_COLOR_NEGATIVE;
+        return PROFIT_COLOR_NEUTRAL;
+    }
+
+    function getProfitCellClass(profit, basePrice) {
+        return `lis-profit-cell-${getProfitState(profit, basePrice)}`;
     }
 
     function buildBreakdownTooltipHtml(rows) {
-        const bodyRows = rows.map(row => `
+        const bodyRows = rows.slice(0, getTooltipRowsCount()).map(row => `
             <tr>
                 <td>${formatCurrency(row.buyPrice)}</td>
                 <td>${formatCurrency(row.salePrice)}</td>
                 <td>${escapeHtml(row.lotsCount || '-')}</td>
-                <td class="${getProfitCellClass(row.grossProfit)}">${formatMoney(row.grossProfit)}</td>
+                <td class="${getProfitCellClass(row.grossProfit, row.buyPrice)}">${formatMoney(row.grossProfit)}</td>
                 <td>${formatCurrency(row.commission)}</td>
                 <td>${formatCurrency(row.netSale)}</td>
-                <td class="${getProfitCellClass(row.netProfit)}">${formatMoney(row.netProfit)}</td>
+                <td class="${getProfitCellClass(row.netProfit, row.buyPrice)}">${formatMoney(row.netProfit)}</td>
+                <td class="${getProfitCellClass(row.netProfit, row.buyPrice)}">${formatProfitPercent(row.netProfit, row.buyPrice)}</td>
             </tr>
         `).join('');
 
@@ -1263,13 +1468,14 @@
             <table>
                 <thead>
                     <tr>
-                        <th>Цена покупки</th>
-                        <th>Цена продажи</th>
-                        <th>Лотов</th>
-                        <th>Профит без комиссии</th>
-                        <th>Сумма комиссии</th>
-                        <th>Сумма зачисления</th>
+                        <th>Покупка</th>
+                        <th>Продажа</th>
+                        <th>Лоты</th>
+                        <th>Без комиссии</th>
+                        <th>Комиссия</th>
+                        <th>К получению</th>
                         <th>Профит</th>
+                        <th>Выгода</th>
                     </tr>
                 </thead>
                 <tbody>${bodyRows}</tbody>
@@ -1371,24 +1577,70 @@
         return getProfitPercentFromBadge(badge, profit);
     }
 
+    function isVisibleCard(card) {
+        return card.style.display !== 'none';
+    }
+
+    function isErrorBadgeText(text) {
+        return text.startsWith('Ошибка')
+            || text.startsWith('Ответ Steam')
+            || text.startsWith('Страница Steam')
+            || text.startsWith('Steam не ответил')
+            || text.startsWith('Лимит повторов')
+            || text.startsWith('Блок ');
+    }
+
+    function getResultStats() {
+        const cards = Array.from(document.querySelectorAll('.skins-market-skins-list > .item')).filter(isVisibleCard);
+        const stats = {
+            total: cards.length,
+            profitable: 0,
+            errors: 0,
+            noOrders: 0
+        };
+
+        cards.forEach(card => {
+            const badge = card.querySelector('.steam-highest-buy-order-link[data-lis-helper-badge="true"]');
+            if (!badge) return;
+
+            const badgeText = badge.innerText || '';
+            if (badgeText === 'Нет заявок' || badgeText === 'Нет лотов') {
+                stats.noOrders++;
+                return;
+            }
+            if (isErrorBadgeText(badgeText)) {
+                stats.errors++;
+                return;
+            }
+
+            const profitPercent = getProfitPercentFromCard(card);
+            if (profitPercent !== null && profitPercent >= PROFITABLE_PERCENT_THRESHOLD) {
+                stats.profitable++;
+            }
+        });
+
+        return stats;
+    }
+
+    function formatResultStats(stats = getResultStats()) {
+        return `Готово: ${stats.total} карточек, выгодных ${stats.profitable}, ошибок ${stats.errors}, без лотов ${stats.noOrders}`;
+    }
+
     function applyProfitBadgeColor(badge, profit) {
-        const PROFITABLE_PERCENT_THRESHOLD = 20;
         const profitPercent = getProfitPercentFromBadge(badge, profit);
 
-        if (badge.innerText === 'Загрузка...') {
-            badge.style.background = '#7c5ce7';
-        } else if (badge.innerText.startsWith('Пауза 429')) {
-            badge.style.background = '#7289da';
-        } else if (badge.innerText === 'Нет заявок') {
-            badge.style.background = '#607d8b';
-        } else if (badge.innerText.startsWith('Ошибка')) {
-            badge.style.background = '#f04747';
-        } else if (profit !== null && profit < 0) {
-            badge.style.background = '#f04747';
-        } else if (profitPercent !== null && profitPercent > PROFITABLE_PERCENT_THRESHOLD) {
-            badge.style.background = '#43b581';
+        if (badge.innerText === 'Загружаю') {
+            badge.style.background = COLOR_LOADING;
+        } else if (badge.innerText.startsWith('Пауза Steam')) {
+            badge.style.background = COLOR_PAUSED;
+        } else if (badge.innerText === 'Нет заявок' || badge.innerText === 'Нет лотов') {
+            badge.style.background = COLOR_NO_ORDERS;
+        } else if (isErrorBadgeText(badge.innerText || '')) {
+            badge.style.background = PROFIT_COLOR_NEGATIVE;
+        } else if (profitPercent !== null) {
+            badge.style.background = getProfitColorByState(getProfitState(profitPercent, 100));
         } else {
-            badge.style.background = '#ff9800';
+            badge.style.background = PROFIT_COLOR_NEUTRAL;
         }
     }
 
@@ -1402,18 +1654,15 @@
         });
     }
 
-    // Функция сортировки карточек по значению выгоды (от большего к меньшему)
     function sortCardsByProfit(updateStatus = true) {
         const gridContainer = document.querySelector('.skins-market-skins-list');
         const statusDiv = document.getElementById('combine-status');
         if (!gridContainer) return;
 
-        if (updateStatus && statusDiv) statusDiv.innerText = "Сортировка по выгоде...";
+        if (updateStatus && statusDiv) statusDiv.innerText = "Сортирую по выгоде";
 
-        // Получаем массив всех карточек
         const cardsArray = Array.from(gridContainer.querySelectorAll('.skins-market-skins-list > .item'));
 
-        // Сортируем: карточки с большей выгодой идут вверх. Карточки без данных уходят вниз.
         cardsArray.sort((a, b) => {
             const profitPercentA = getProfitPercentFromCard(a);
             const profitPercentB = getProfitPercentFromCard(b);
@@ -1421,11 +1670,10 @@
             return (profitPercentB ?? -999998) - (profitPercentA ?? -999998);
         });
 
-        // Перепривязываем элементы в DOM в новом порядке
         cardsArray.forEach(card => gridContainer.appendChild(card));
         updateProfitBadgeColors(cardsArray);
 
-        if (updateStatus && statusDiv) statusDiv.innerText = "Готово! Отсортировано.";
+        if (updateStatus && statusDiv) statusDiv.innerText = "Готово";
     }
 
     function applyDiffFilter(operation) {
@@ -1434,7 +1682,6 @@
         const minVal = parseFloat(document.getElementById('diff-num-input').value) || 0;
         const allCards = document.querySelectorAll('.skins-market-skins-list .item');
 
-        // ОПТИМИЗАЦИЯ: Вынесли определение AppID из цикла, чтобы не проверять URL на каждой карточке
         let currentAppId = 252490; // По умолчанию Rust
         const currentUrl = window.location.href;
         if (currentUrl.includes('/cs2/') || currentUrl.includes('/csgo/')) currentAppId = 730;
@@ -1465,17 +1712,16 @@
                         steamLink.target = '_blank';
                         steamLink.style = `
                         position: absolute; top: 32px; left: 10px; right: 10px; z-index: 30;
-                        background: #7c5ce7; color: #fff !important; padding: 3px 8px;
+                        background: ${COLOR_LOADING}; color: ${COLOR_TEXT} !important; padding: 3px 8px;
                         font-family: Arial, "Helvetica Neue", sans-serif;
                         font-size: 11px; font-weight: bold; border-radius: 4px;
-                        text-decoration: none !important; box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+                        text-decoration: none !important; box-shadow: 0 2px 5px ${COLOR_BADGE_SHADOW};
                         display: block; box-sizing: border-box; line-height: 1.25;
                         white-space: normal; overflow-wrap: anywhere; text-align: left;
                         `;
-                        steamLink.innerText = 'Загрузка...';
+                        steamLink.innerText = 'Загружаю';
                         attachProfitTooltip(steamLink);
 
-                        // Парсим цену самого скина на LIS-SKINS и сохраняем в дата-атрибут ссылки
                         const lisPriceElem = totalCard.querySelector('.price');
                         const lisPrice = lisPriceElem ? parseFloat(lisPriceElem.innerText.replace(/[^0-9.,]/g, '').replace(',', '.')) : 0;
                         steamLink.setAttribute('data-lis-price', lisPrice);
@@ -1486,15 +1732,15 @@
                             return;
                         }
 
-                        const targetSteamUrl = `https://steamcommunity.com/market/listings/${currentAppId}/${encodeSteamMarketHashName(itemName)}`;
+                        const steamMarketHashName = normalizeSteamMarketHashName(itemName, currentAppId);
+                        const targetSteamUrl = `https://steamcommunity.com/market/listings/${currentAppId}/${encodeSteamMarketHashName(steamMarketHashName)}`;
                         steamLink.setAttribute('href', targetSteamUrl);
                         totalCard.appendChild(steamLink);
 
-                        // Добавляем задачу в очередь запросов
                         steamRequestsQueue.push({
                             targetUrl: targetSteamUrl,
                             appId: currentAppId,
-                            marketHashName: itemName,
+                            marketHashName: steamMarketHashName,
                             targetLinkElement: steamLink,
                             totalCard: totalCard
                         });
@@ -1505,10 +1751,33 @@
             }
         });
 
-        if (!isQueueRunning && isOperationActive(operation)) {
+        const queuedCount = steamRequestsQueue.length;
+
+        if (queuedCount > 0 && !isQueueRunning && isOperationActive(operation)) {
             processNextSteamRequest(operation);
         }
 
+        return queuedCount;
+    }
+
+    function finishAfterDiffFilter(operation, queuedCount) {
+        if (!isOperationActive(operation)) return;
+
+        if (queuedCount === 0) {
+            const hasBadges = document.querySelector('.steam-highest-buy-order-link[data-lis-helper-badge="true"]');
+            if (hasBadges) {
+                sortCardsByProfit();
+                finishOperation(operation);
+                return;
+            }
+
+            finishOperation(operation, 'Готово!');
+            showSuccessToast('Готово. Подходящих карточек нет.');
+            return;
+        }
+
+        const statusDiv = document.getElementById('combine-status');
+        if (statusDiv) statusDiv.innerText = `Steam: старт`;
     }
 
     async function loadMorePages() {
@@ -1529,24 +1798,31 @@
 
         const gridContainer = document.querySelector('.skins-market-skins-list');
         if (!gridContainer) {
-            finishOperation(operation, "Ошибка сетки!");
+            finishOperation(operation, "Не найдена сетка карточек");
             return;
         }
 
         if (pagesCount <= 1) {
-            applyDiffFilter(operation);
-            if (isOperationActive(operation)) statusDiv.innerText = "Фильтр 1-й стр.";
+            const queuedCount = applyDiffFilter(operation);
+            if (isOperationActive(operation)) statusDiv.innerText = "Проверяю карточки";
+            finishAfterDiffFilter(operation, queuedCount);
             return;
         }
 
         const baseUrl = window.location.origin + window.location.pathname;
         const searchParams = new URLSearchParams(window.location.search);
+        operation.lisProgress = {
+            total: pagesCount - 1,
+            completed: 0,
+            pagesCount,
+            startedAt: Date.now()
+        };
 
         for (let p = 2; p <= pagesCount; p++) {
             searchParams.set('page', p);
             const targetUrl = `${baseUrl}?${searchParams.toString()}`;
             if (!isOperationActive(operation)) return;
-            statusDiv.innerText = `Загрузка страницы ${p}/${pagesCount}, осталось ${pagesCount - p}`;
+            updateLisProgress(operation);
 
             let cleanup = null;
             let requestTimedOut = false;
@@ -1582,6 +1858,7 @@
                     gridContainer.appendChild(clonedCard);
                     addedInThisPage++;
                 });
+                operation.lisProgress.completed++;
                 if (addedInThisPage === 0) break;
             } catch (err) {
                 if (cleanup) {
@@ -1592,28 +1869,20 @@
 
                 if (requestTimedOut) {
                     showErrorToast(`Страница ${p} LIS не ответила за ${LIS_PAGE_REQUEST_TIMEOUT_MS / 1000} секунд.`);
-                    statusDiv.innerText = `Таймаут при загрузке страницы ${p}. Обрабатываем уже загруженные.`;
+                    statusDiv.innerText = `Таймаут LIS на странице ${p}. Обрабатываем загруженное.`;
                 } else {
                     showErrorToast(`Не удалось загрузить страницу ${p} LIS.`);
-                    statusDiv.innerText = `Ошибка загрузки страницы ${p}. Обрабатываем уже загруженные.`;
+                    statusDiv.innerText = `Ошибка LIS на странице ${p}. Обрабатываем загруженное.`;
                 }
                 break;
             }
         }
 
         if (!isOperationActive(operation)) return;
-        statusDiv.innerText = "Фильтрация...";
+        statusDiv.innerText = "Проверяю карточки";
 
-        applyDiffFilter(operation);
-
-        // Если страниц для обработки не оказалось (очередь пуста), разблокируем кнопку сразу здесь.
-        // Если карточки есть, разблокировка произойдет в конце processNextSteamRequest.
-        if (steamRequestsQueue.length === 0) {
-            finishOperation(operation, 'Готово!');
-            showSuccessToast('Фильтрация завершена. Нет подходящих карточек.');
-        } else if (isOperationActive(operation)) {
-            statusDiv.innerText = `Загрузка цен Steam...`;
-        }
+        const queuedCount = applyDiffFilter(operation);
+        finishAfterDiffFilter(operation, queuedCount);
     }
 
     const observer = new MutationObserver(() => {
