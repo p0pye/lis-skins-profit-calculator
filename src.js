@@ -351,6 +351,20 @@
             'there are no active buy orders',
             'there are no buy orders',
             'no active buy orders',
+            'нет предложений о продаже',
+            'предмет недоступен',
+            'запрашиваемый предмет, возможно, не существует',
+            'не удалось загрузить этот контент',
+            'не удалось найти этот предмет',
+            'failed to load item description',
+            'there was an error loading item data',
+            'the item specified was not found',
+            'there are no listings',
+            'there are currently no listings',
+            'no listings',
+            'item not found',
+            'item may not exist',
+            'this item is unavailable',
             'keine aktiven kaufaufträge',
             'aucun ordre d’achat actif'
         ];
@@ -360,17 +374,26 @@
 
     function findBuyOrdersTable(labelElement) {
         const isTable = element => element?.matches?.('table');
-        const findTableInside = element => element?.querySelector?.(':scope > table') || null;
+        const findUsableTableInside = element => {
+            if (!element?.querySelectorAll) return null;
+
+            return Array.from(element.querySelectorAll('table')).find(isBuyOrdersTable) || null;
+        };
 
         if (!labelElement) return null;
 
         let current = labelElement;
-        for (let depth = 0; current && depth < 2; depth++, current = current.parentElement) {
-            const sibling = current.nextElementSibling;
-            if (isTable(sibling)) return sibling;
+        for (let depth = 0; current && depth < 7; depth++, current = current.parentElement) {
+            if (isTable(current) && isBuyOrdersTable(current)) return current;
 
-            const directTable = findTableInside(sibling);
-            if (directTable) return directTable;
+            const nestedTable = findUsableTableInside(current);
+            if (nestedTable) return nestedTable;
+
+            const sibling = current.nextElementSibling;
+            if (isTable(sibling) && isBuyOrdersTable(sibling)) return sibling;
+
+            const siblingTable = findUsableTableInside(sibling);
+            if (siblingTable) return siblingTable;
         }
 
         return null;
@@ -386,6 +409,120 @@
             return currencyPattern.test(text) && isValidPrice(parsePriceValue(text));
         });
         return withCurrency ? normalizeItemName(withCurrency.textContent) : '';
+    }
+
+    function parseBuyOrderSummaryText(text) {
+        const normalized = normalizeItemName(text);
+        const patterns = [
+            {
+                regex: /([\d][\d\s,.]*)\s+(?:requests?\s+to\s+buy|buy\s+requests?|buy\s+orders?)\s+at\s+(.+?)\s+(?:or\s+lower|or\s+less)/i,
+                countIndex: 1,
+                priceIndex: 2
+            },
+            {
+                regex: /([\d][\d\s,.]*)\s+(?:заяв(?:ок|ки|ка)|запрос(?:ов|а)?)\s+на\s+покупку\s+(?:по\s+цене\s+)?(.+?)\s+(?:или\s+ниже|и\s+ниже|или\s+меньше)/i,
+                countIndex: 1,
+                priceIndex: 2
+            },
+            {
+                regex: /(?:requests?\s+to\s+buy|buy\s+requests?|buy\s+orders?)\s+at\s+(.+?)\s+(?:or\s+lower|or\s+less)\s*:?\s*([\d][\d\s,.]*)/i,
+                countIndex: 2,
+                priceIndex: 1
+            },
+            {
+                regex: /(?:заяв(?:ок|ки|ка)|запрос(?:ов|а)?)\s+на\s+покупку\s+(?:по\s+цене\s+)?(.+?)\s+(?:или\s+ниже|и\s+ниже|или\s+меньше)\s*:?\s*([\d][\d\s,.]*)/i,
+                countIndex: 2,
+                priceIndex: 1
+            }
+        ];
+
+        for (const { regex, countIndex, priceIndex } of patterns) {
+            const match = normalized.match(regex);
+            if (!match) continue;
+
+            const ordersCount = match[countIndex].replace(/\s| /g, '').replace(/[^\d.,]/g, '');
+            const priceText = normalizeItemName(match[priceIndex]);
+            const salePrice = parsePriceValue(priceText);
+            if (!/\d/.test(ordersCount) || !isValidPrice(salePrice)) continue;
+
+            return {
+                priceText,
+                ordersCount,
+                isSummary: true
+            };
+        }
+
+        return null;
+    }
+
+    function getSteamOrderRowsFromText(text) {
+        const normalized = normalizeItemName(text);
+        const tableStartMatch = normalized.match(/(?:Цена\s+Кол-?во|Price\s+Qty|Price\s+Quantity)/i);
+        if (!tableStartMatch) return [];
+
+        const tableText = normalized.slice(tableStartMatch.index + tableStartMatch[0].length);
+        const pricePattern = '(?:[₽$€£¥₴₸₹]\\s*)?\\d[\\d\\s]*(?:[,.]\\d{1,2})?\\s*(?:руб\\.?|USD|EUR)?(?:\\s+(?:или|и)\\s+ниже)?';
+        const rowPattern = new RegExp(`(${pricePattern})\\s+(\\d[\\d\\s,.]*?)(?=\\s+${pricePattern}|$)`, 'gi');
+        const rows = [];
+
+        for (const match of tableText.matchAll(rowPattern)) {
+            const salePriceText = normalizeItemName(match[1]);
+            const salePrice = parsePriceValue(salePriceText);
+            const ordersCount = normalizeItemName(match[2]).replace(/\s| /g, '').replace(/[^\d.,]/g, '');
+
+            if (!isValidPrice(salePrice) || !/\d/.test(ordersCount)) continue;
+
+            rows.push({
+                salePriceText,
+                ordersCount,
+                salePrice
+            });
+
+            if (rows.length >= MAX_STEAM_TOOLTIP_ROWS) break;
+        }
+
+        return rows;
+    }
+
+    function findBuyOrderRowsNearLabel(labelElement) {
+        if (!labelElement) return [];
+
+        let current = labelElement;
+        for (let depth = 0; current && depth < 7; depth++, current = current.parentElement) {
+            const currentRows = getSteamOrderRowsFromText(current.textContent || '');
+            if (currentRows.length > 0) return currentRows;
+
+            const siblingRows = getSteamOrderRowsFromText(current.nextElementSibling?.textContent || '');
+            if (siblingRows.length > 0) return siblingRows;
+        }
+
+        return [];
+    }
+
+    function isBuyOrdersTable(table) {
+        if (!table) return false;
+
+        const headerText = normalizeItemName(Array.from(table.querySelectorAll('thead th')).map(th => th.textContent).join(' ')).toLowerCase();
+        const hasPriceHeader = /(?:цена|price)/i.test(headerText);
+        const hasCountHeader = /(?:кол-?во|количество|qty|quantity)/i.test(headerText);
+
+        return hasPriceHeader && hasCountHeader && getSteamOrderRows(table).length > 0;
+    }
+
+    function findBuyOrdersTableBySummary(doc, summary) {
+        if (!doc || !summary) return null;
+
+        const summaryPrice = parsePriceValue(summary.priceText);
+        if (!isValidPrice(summaryPrice)) return null;
+
+        return Array.from(doc.querySelectorAll('table')).find(table => {
+            if (!isBuyOrdersTable(table)) return false;
+
+            const firstRow = getFirstOrderRowData(table);
+            if (!firstRow) return false;
+
+            return Math.abs(parsePriceValue(firstRow.priceText) - summaryPrice) < 0.01;
+        }) || null;
     }
 
     function getFirstOrderRowData(table) {
@@ -432,19 +569,185 @@
 
         for (const element of textElements) {
             const table = findBuyOrdersTable(element);
-            const firstRow = getFirstOrderRowData(table);
-            const priceText = getPriceTextFromBuyOrderLabel(element);
+            const textRows = table ? [] : findBuyOrderRowsNearLabel(element);
+            const firstRow = getFirstOrderRowData(table) || (textRows[0] ? {
+                priceText: textRows[0].salePriceText,
+                ordersCount: textRows[0].ordersCount
+            } : null);
+            const summary = parseBuyOrderSummaryText(element.textContent);
+            const summaryTable = !table && summary ? findBuyOrdersTableBySummary(doc, summary) : null;
+            const resolvedTable = table || summaryTable;
+            const resolvedRows = resolvedTable ? [] : textRows;
+            const resolvedFirstRow = getFirstOrderRowData(resolvedTable) || firstRow;
+            const priceText = resolvedFirstRow?.priceText || summary?.priceText || getPriceTextFromBuyOrderLabel(element);
 
             if (isValidPrice(parsePriceValue(priceText))) {
                 return {
                     priceText,
-                    ordersCount: firstRow?.ordersCount || '',
-                    table
+                    ordersCount: resolvedFirstRow?.ordersCount || (!summary?.isSummary ? summary?.ordersCount : '') || '',
+                    table: resolvedTable,
+                    steamOrderRows: resolvedTable ? undefined : resolvedRows.length > 0 ? resolvedRows : undefined,
+                    isSummary: !resolvedTable && resolvedRows.length === 0 && Boolean(summary?.isSummary)
                 };
             }
         }
 
-        return null;
+        return parseBuyOrderSummaryText(doc.body?.textContent || '');
+    }
+
+    function findSteamItemNameId(htmlText) {
+        const patterns = [
+            /Market_LoadOrderSpread\(\s*(\d+)\s*\)/,
+            /LoadOrderSpread\(\s*(\d+)\s*\)/,
+            /itemordershistogram\?[^"']*item_nameid=(\d+)/,
+            /item_nameid[=:](\d+)/,
+            /["']item_nameid["']\s*:\s*["']?(\d+)/,
+            /\bitem_nameid\s*=\s*["']?(\d+)/
+        ];
+
+        for (const pattern of patterns) {
+            const match = htmlText.match(pattern);
+            if (match) return match[1];
+        }
+
+        return '';
+    }
+
+    function getSteamOrderRowsFromHistogram(buyOrderGraph) {
+        if (!Array.isArray(buyOrderGraph)) return [];
+
+        return buyOrderGraph.slice(0, MAX_STEAM_TOOLTIP_ROWS).map(row => {
+            const salePrice = parsePriceValue(row?.[0]);
+            const ordersCount = row?.[1] !== undefined ? String(row[1]).replace(/\s| /g, '') : '';
+
+            if (!isValidPrice(salePrice)) return null;
+
+            return {
+                salePriceText: formatCurrency(salePrice),
+                ordersCount,
+                salePrice
+            };
+        }).filter(Boolean);
+    }
+
+    function findSteamBuyOrdersFromHistogram(histogram) {
+        const steamOrderRows = getSteamOrderRowsFromHistogram(histogram?.buy_order_graph);
+        const firstRow = steamOrderRows[0];
+        if (!firstRow) return null;
+
+        return {
+            priceText: firstRow.salePriceText,
+            ordersCount: firstRow.ordersCount,
+            steamOrderRows
+        };
+    }
+
+    function fetchSteamOrderHistogram(itemNameId, operation, onComplete) {
+        const requestUrl = new URL('https://steamcommunity.com/market/itemordershistogram');
+        requestUrl.searchParams.set('country', 'RU');
+        requestUrl.searchParams.set('language', 'russian');
+        requestUrl.searchParams.set('currency', '5');
+        requestUrl.searchParams.set('item_nameid', itemNameId);
+        requestUrl.searchParams.set('two_factor', '0');
+
+        return GM_xmlhttpRequest({
+            method: 'GET',
+            url: requestUrl.toString(),
+            timeout: STEAM_REQUEST_TIMEOUT_MS,
+            onload: function(response) {
+                if (!isOperationActive(operation)) {
+                    if (onComplete) onComplete('cancelled');
+                    return;
+                }
+
+                if (response.status === 429) {
+                    if (onComplete) onComplete(429);
+                    return;
+                }
+
+                if (response.status !== 200) {
+                    if (onComplete) onComplete(response.status);
+                    return;
+                }
+
+                try {
+                    const histogram = JSON.parse(response.responseText);
+                    if (histogram?.success === 0) {
+                        if (onComplete) onComplete('histogram-error');
+                        return;
+                    }
+
+                    const buyOrders = findSteamBuyOrdersFromHistogram(histogram);
+                    if (onComplete) onComplete(200, buyOrders ? { status: 'price', buyOrders } : { status: 'no-orders' });
+                } catch (e) {
+                    if (onComplete) onComplete('histogram-error');
+                }
+            },
+            onerror: function() {
+                if (onComplete) onComplete('error');
+            },
+            ontimeout: function() {
+                if (onComplete) onComplete('timeout');
+            },
+            onabort: function() {
+                if (onComplete) onComplete('cancelled');
+            }
+        });
+    }
+
+    function fetchSteamListingRender(targetUrl, operation, onComplete) {
+        const listingUrl = new URL(targetUrl);
+        const requestUrl = new URL(`${listingUrl.pathname.replace(/\/$/, '')}/render/`, listingUrl.origin);
+        requestUrl.searchParams.set('query', '');
+        requestUrl.searchParams.set('start', '0');
+        requestUrl.searchParams.set('count', String(MAX_STEAM_TOOLTIP_ROWS));
+        requestUrl.searchParams.set('country', 'RU');
+        requestUrl.searchParams.set('language', 'russian');
+        requestUrl.searchParams.set('currency', '5');
+
+        return GM_xmlhttpRequest({
+            method: 'GET',
+            url: requestUrl.toString(),
+            timeout: STEAM_REQUEST_TIMEOUT_MS,
+            onload: function(response) {
+                if (!isOperationActive(operation)) {
+                    if (onComplete) onComplete('cancelled');
+                    return;
+                }
+
+                if (response.status === 429) {
+                    if (onComplete) onComplete(429);
+                    return;
+                }
+
+                if (response.status !== 200) {
+                    if (onComplete) onComplete(response.status);
+                    return;
+                }
+
+                try {
+                    const data = JSON.parse(response.responseText);
+                    if (data?.success === false || data?.success === 0) {
+                        if (onComplete) onComplete('render-error');
+                        return;
+                    }
+
+                    const buyOrders = findSteamBuyOrdersFromHistogram(data);
+                    if (onComplete) onComplete(200, buyOrders ? { status: 'price', buyOrders } : { status: 'no-orders' });
+                } catch (e) {
+                    if (onComplete) onComplete('render-error');
+                }
+            },
+            onerror: function() {
+                if (onComplete) onComplete('error');
+            },
+            ontimeout: function() {
+                if (onComplete) onComplete('timeout');
+            },
+            onabort: function() {
+                if (onComplete) onComplete('cancelled');
+            }
+        });
     }
 
     async function processNextSteamRequest(operation) {
@@ -1078,6 +1381,113 @@
     function fetchSteamPriceFromHTML(targetUrl, marketHashName, targetLinkElement, totalCard, operation, onComplete) {
         const requestUrl = new URL(targetUrl);
         requestUrl.searchParams.set('l', 'russian');
+        let histogramRequest = null;
+        let renderRequest = null;
+
+        const applySteamBuyOrders = (buyOrders) => {
+            const priceText = buyOrders.priceText;
+            const ordersCount = buyOrders.ordersCount;
+            const nextTable = buyOrders.table;
+            const lisPrice = parseFloat(targetLinkElement.getAttribute('data-lis-price')) || 0;
+            const steamOrderRows = buyOrders.steamOrderRows || getSteamOrderRows(nextTable);
+            const breakdownRows = calculateSteamBreakdownRows(steamOrderRows, lisPrice);
+
+            targetLinkElement.innerText = formatPriceWithProfit(priceText, targetLinkElement, ordersCount);
+
+            const steamPrice = parsePriceValue(priceText);
+
+            if (!isValidPrice(lisPrice) || !isValidPrice(steamPrice)) {
+                setCardPriceError(
+                    targetLinkElement,
+                    totalCard,
+                    !isValidPrice(lisPrice) ? 'Ошибка цены LIS' : 'Ошибка цены Steam'
+                );
+                return false;
+            }
+
+            const calculatedProfit = calculateNetProfit(steamPrice, lisPrice);
+            totalCard.setAttribute('data-calculated-profit', calculatedProfit);
+            setSteamBreakdown(targetLinkElement, breakdownRows);
+            applyProfitBadgeColor(targetLinkElement, calculatedProfit);
+
+            return {
+                status: 'price',
+                priceText,
+                ordersCount,
+                steamOrderRows
+            };
+        };
+
+        const showParserError = (reason, status = 'parser-error') => {
+            console.error(`[Profit Calculator Parser Error] ${reason} for "${marketHashName}"`);
+            targetLinkElement.innerText = "Ответ Steam не распознан";
+            targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
+            totalCard.setAttribute('data-calculated-profit', -999999);
+            if (onComplete) onComplete(status);
+        };
+
+        const fetchHistogramOrFallback = (itemNameId, fallbackBuyOrders = null) => {
+            histogramRequest = fetchSteamOrderHistogram(itemNameId, operation, (status, data) => {
+                if (status === 429) {
+                    if (onComplete) onComplete(429);
+                    return;
+                }
+
+                if (status === 200 && data?.status === 'price') {
+                    const result = applySteamBuyOrders(data.buyOrders);
+                    if (onComplete) onComplete(result ? 200 : 'invalid-price', result || undefined);
+                    return;
+                }
+
+                if (fallbackBuyOrders) {
+                    const result = applySteamBuyOrders(fallbackBuyOrders);
+                    if (onComplete) onComplete(result ? 200 : 'invalid-price', result || undefined);
+                    return;
+                }
+
+                if (status === 200 && data?.status === 'no-orders') {
+                    setCardNoBuyOrders(targetLinkElement, totalCard);
+                    if (onComplete) onComplete(200, { status: 'no-orders' });
+                    return;
+                }
+
+                showParserError(`Histogram fallback failed. Status: ${status}`);
+            });
+        };
+
+        const fetchRenderOrFallback = (itemNameId = '', fallbackBuyOrders = null) => {
+            renderRequest = fetchSteamListingRender(targetUrl, operation, (status, data) => {
+                if (status === 429) {
+                    if (onComplete) onComplete(429);
+                    return;
+                }
+
+                if (status === 200 && data?.status === 'price') {
+                    const result = applySteamBuyOrders(data.buyOrders);
+                    if (onComplete) onComplete(result ? 200 : 'invalid-price', result || undefined);
+                    return;
+                }
+
+                if (itemNameId) {
+                    fetchHistogramOrFallback(itemNameId, fallbackBuyOrders);
+                    return;
+                }
+
+                if (fallbackBuyOrders) {
+                    const result = applySteamBuyOrders(fallbackBuyOrders);
+                    if (onComplete) onComplete(result ? 200 : 'invalid-price', result || undefined);
+                    return;
+                }
+
+                if (status === 200 && data?.status === 'no-orders') {
+                    setCardNoBuyOrders(targetLinkElement, totalCard);
+                    if (onComplete) onComplete(200, { status: 'no-orders' });
+                    return;
+                }
+
+                showParserError(`Render fallback failed. Status: ${status}`);
+            });
+        };
 
         const request = GM_xmlhttpRequest({
             method: "GET",
@@ -1116,50 +1526,30 @@
                     const buyOrders = findSteamBuyOrders(doc);
                     let priceFound = false;
                     if (buyOrders) {
-                        const priceText = buyOrders.priceText;
-                        const ordersCount = buyOrders.ordersCount;
-                        const nextTable = buyOrders.table;
-                        const lisPrice = parseFloat(targetLinkElement.getAttribute('data-lis-price')) || 0;
-                        const steamOrderRows = getSteamOrderRows(nextTable);
-                        const breakdownRows = calculateSteamBreakdownRows(steamOrderRows, lisPrice);
+                        const itemNameId = findSteamItemNameId(htmlText);
+                        const hasDetailedRows = buyOrders.table || (Array.isArray(buyOrders.steamOrderRows) && buyOrders.steamOrderRows.length > 0);
+                        if (!hasDetailedRows) {
+                            fetchRenderOrFallback(itemNameId, buyOrders);
+                            return;
+                        }
 
-                        targetLinkElement.innerText = formatPriceWithProfit(priceText, targetLinkElement, ordersCount);
-                        priceFound = true;
-
-                        const steamPrice = parsePriceValue(priceText);
-
-                        if (!isValidPrice(lisPrice) || !isValidPrice(steamPrice)) {
-                            setCardPriceError(
-                                targetLinkElement,
-                                totalCard,
-                                !isValidPrice(lisPrice) ? 'Ошибка цены LIS' : 'Ошибка цены Steam'
-                            );
+                        const result = applySteamBuyOrders(buyOrders);
+                        if (!result) {
                             if (onComplete) onComplete('invalid-price');
                             return;
                         }
 
-                        const calculatedProfit = calculateNetProfit(steamPrice, lisPrice);
-                        totalCard.setAttribute('data-calculated-profit', calculatedProfit);
-                        setSteamBreakdown(targetLinkElement, breakdownRows);
-                        applyProfitBadgeColor(targetLinkElement, calculatedProfit);
-
-                        if (onComplete) onComplete(200, {
-                            status: 'price',
-                            priceText,
-                            ordersCount,
-                            steamOrderRows
-                        });
+                        priceFound = true;
+                        if (onComplete) onComplete(200, result);
                     }
 
                     if (!priceFound && hasExplicitNoBuyOrdersMessage(doc)) {
                         setCardNoBuyOrders(targetLinkElement, totalCard);
                         if (onComplete) onComplete(200, { status: 'no-orders' });
                     } else if (!priceFound) {
-                        console.error(`[Profit Calculator Parser Error] Не удалось распознать данные Steam для "${marketHashName}"`);
-                        targetLinkElement.innerText = "Ответ Steam не распознан";
-                        targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
-                        totalCard.setAttribute('data-calculated-profit', -999999);
-                        if (onComplete) onComplete('parser-error');
+                        const itemNameId = findSteamItemNameId(htmlText);
+                        console.error(`[Profit Calculator Debug] HTML parser did not find buy orders for "${marketHashName}". item_nameid="${itemNameId || 'not found'}"`);
+                        fetchRenderOrFallback(itemNameId);
                     }
                 } catch (e) {
                     console.error(`[Profit Calculator Error] Сбой обработки DOM для "${marketHashName}":`, e);
@@ -1197,7 +1587,13 @@
             }
         });
 
-        return request;
+        return {
+            abort: () => {
+                if (request && typeof request.abort === 'function') request.abort();
+                if (histogramRequest && typeof histogramRequest.abort === 'function') histogramRequest.abort();
+                if (renderRequest && typeof renderRequest.abort === 'function') renderRequest.abort();
+            }
+        };
     }
 
     function formatPriceWithProfit(steamPriceRaw, targetLinkElement, ordersCount = '') {
@@ -1356,13 +1752,13 @@
             const cells = row.querySelectorAll('td');
             const salePriceText = cells[0]?.textContent.trim() || '';
             const salePrice = parsePriceValue(salePriceText);
-            const lotsCount = cells[1]?.textContent.trim().replace(/\s| /g, '') || '';
+            const ordersCount = cells[1]?.textContent.trim().replace(/\s| /g, '') || '';
 
             if (!isValidPrice(salePrice)) return null;
 
             return {
                 salePriceText,
-                lotsCount,
+                ordersCount,
                 salePrice
             };
         }).filter(Boolean);
@@ -1375,7 +1771,7 @@
             .filter(row => isValidPrice(row.salePrice))
             .map(row => ({
                 salePriceText: row.salePriceText,
-                lotsCount: row.lotsCount,
+                ordersCount: row.ordersCount,
                 ...calculateSteamSale(row.salePrice, lisPrice)
             }));
     }
@@ -1415,7 +1811,7 @@
             <tr>
                 <td>${formatCurrency(row.buyPrice)}</td>
                 <td>${formatCurrency(row.salePrice)}</td>
-                <td>${escapeHtml(row.lotsCount || '-')}</td>
+                <td>${escapeHtml(row.ordersCount || '-')}</td>
                 <td class="${getProfitCellClass(row.grossProfit, row.buyPrice)}">${formatMoney(row.grossProfit)}</td>
                 <td>${formatCurrency(row.commission)}</td>
                 <td>${formatCurrency(row.netSale)}</td>
