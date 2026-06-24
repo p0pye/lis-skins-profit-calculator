@@ -262,6 +262,23 @@
         return value;
     }
 
+    function clampProfitDeleteThreshold(value) {
+        let parsed = parseInt(value);
+
+        if (!Number.isFinite(parsed)) parsed = -100;
+        if (parsed < -100) parsed = -100;
+        if (parsed > 30) parsed = 30;
+
+        return parsed;
+    }
+
+    function getProfitDeleteThreshold() {
+        const input = document.getElementById('profit-delete-threshold-num-input');
+        const value = input ? input.value : localStorage.getItem('lis_helper_profit_delete_threshold');
+
+        return clampProfitDeleteThreshold(value);
+    }
+
     function encodeSteamMarketHashName(marketHashName) {
         return encodeURIComponent(marketHashName).replace(/[!'()*|]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
     }
@@ -1326,6 +1343,7 @@
         const savedLisPagesWorkers = localStorage.getItem('lis_helper_pages_workers_count') || '4';
         const savedWorkers = localStorage.getItem('lis_helper_workers_count') || '3';
         const savedTooltipRows = localStorage.getItem('lis_helper_tooltip_rows_count') || '3';
+        const savedProfitDeleteThreshold = clampProfitDeleteThreshold(localStorage.getItem('lis_helper_profit_delete_threshold'));
 
         const panel = document.createElement('div');
         panel.id = 'lis-helper-panel';
@@ -1419,6 +1437,24 @@
             ">
 
             <div class="lis-setting-row">
+                <label>Мин. выгода, от %:</label>
+                <div class="lis-number-control">
+                    <input type="number" id="profit-delete-threshold-num-input" min="-100" max="30" value="${savedProfitDeleteThreshold}" style="
+                        width: 50px; background: ${COLOR_PANEL_FIELD_BG}; color: ${PROFIT_COLOR_NEGATIVE}; border: 1px solid ${COLOR_PANEL_BORDER};
+                        padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
+                    ">
+                    <div class="lis-stepper-buttons">
+                        <button type="button" class="lis-stepper" data-step-target="profit-delete-threshold-num-input" data-step-delta="1">▲</button>
+                        <button type="button" class="lis-stepper" data-step-target="profit-delete-threshold-num-input" data-step-delta="-1">▼</button>
+                    </div>
+                </div>
+                <span class="lis-help" data-tooltip="При сортировке удалять карточки, у которых выгода ниже этого процента.">?</span>
+            </div>
+            <input type="range" id="profit-delete-threshold-to-load" min="-100" max="30" value="${savedProfitDeleteThreshold}" style="
+                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${PROFIT_COLOR_NEGATIVE};
+            ">
+
+            <div class="lis-setting-row">
                 <label>Строк в таблице:</label>
                 <div class="lis-number-control">
                     <input type="number" id="tooltip-rows-num-input" min="1" max="20" value="${Math.min(parseInt(savedTooltipRows), 20)}" style="
@@ -1453,6 +1489,8 @@
             const diffNumber = document.getElementById('diff-num-input');
             const workersSlider = document.getElementById('workers-to-load');
             const workersNumber = document.getElementById('workers-num-input');
+            const profitDeleteThresholdSlider = document.getElementById('profit-delete-threshold-to-load');
+            const profitDeleteThresholdNumber = document.getElementById('profit-delete-threshold-num-input');
             const tooltipRowsSlider = document.getElementById('tooltip-rows-to-load');
             const tooltipRowsNumber = document.getElementById('tooltip-rows-num-input');
             const panelToggle = document.getElementById('lis-panel-toggle');
@@ -1508,7 +1546,7 @@
                 });
             });
 
-            [diffNumber, diffSlider, pagesNumber, pagesSlider, lisPagesWorkersNumber, lisPagesWorkersSlider, workersNumber, workersSlider, tooltipRowsNumber, tooltipRowsSlider].forEach(input => {
+            [diffNumber, diffSlider, pagesNumber, pagesSlider, lisPagesWorkersNumber, lisPagesWorkersSlider, workersNumber, workersSlider, profitDeleteThresholdNumber, profitDeleteThresholdSlider, tooltipRowsNumber, tooltipRowsSlider].forEach(input => {
                 input.addEventListener('wheel', function(event) {
                     event.preventDefault();
                     stepInputValue(this, event.deltaY < 0 ? 1 : -1);
@@ -1557,6 +1595,16 @@
                 this.value = val;
                 workersSlider.value = val;
                 localStorage.setItem('lis_helper_workers_count', val);
+            });
+            profitDeleteThresholdSlider.addEventListener('input', function() {
+                profitDeleteThresholdNumber.value = this.value;
+                localStorage.setItem('lis_helper_profit_delete_threshold', this.value);
+            });
+            profitDeleteThresholdNumber.addEventListener('input', function() {
+                const val = clampProfitDeleteThreshold(this.value);
+                this.value = val;
+                profitDeleteThresholdSlider.value = val;
+                localStorage.setItem('lis_helper_profit_delete_threshold', val);
             });
             tooltipRowsSlider.addEventListener('input', function() {
                 tooltipRowsNumber.value = this.value;
@@ -2240,7 +2288,18 @@
 
         if (updateStatus && statusDiv) statusDiv.innerText = "Сортирую по выгоде";
 
-        const cardsArray = Array.from(gridContainer.querySelectorAll('.skins-market-skins-list > .item'));
+        const deleteThreshold = getProfitDeleteThreshold();
+        let cardsArray = Array.from(gridContainer.querySelectorAll('.skins-market-skins-list > .item'));
+
+        cardsArray = cardsArray.filter(card => {
+            const profitPercent = getProfitPercentFromCard(card);
+            if (profitPercent !== null && profitPercent < deleteThreshold) {
+                card.remove();
+                return false;
+            }
+
+            return true;
+        });
 
         cardsArray.sort((a, b) => {
             const profitPercentA = getProfitPercentFromCard(a);
