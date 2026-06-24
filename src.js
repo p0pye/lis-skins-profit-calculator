@@ -288,14 +288,14 @@
 
     function getCsExteriorCategoryValue(exteriorText) {
         const exteriorCategories = {
-            'Factory New': 'WearCategory0',
-            'Minimal Wear': 'WearCategory1',
-            'Field-Tested': 'WearCategory2',
-            'Battle-Scarred': 'WearCategory3',
-            'Well-Worn': 'WearCategory4'
+            'factory new': 'WearCategory0',
+            'minimal wear': 'WearCategory1',
+            'field-tested': 'WearCategory2',
+            'well-worn': 'WearCategory3',
+            'battle-scarred': 'WearCategory4'
         };
 
-        return exteriorCategories[exteriorText] || '';
+        return exteriorCategories[normalizeItemName(exteriorText).toLowerCase()] || '';
     }
 
     function buildSteamListingUrl(appId, marketHashName, totalCard) {
@@ -704,6 +704,93 @@
         };
     }
 
+    function getSteamOrderRowsFromOrderBook(orderBook) {
+        const compactBuyOrders = orderBook?.rgCompactBuyOrders;
+        if (!Array.isArray(compactBuyOrders)) return [];
+
+        const rows = [];
+        for (let i = 0; i + 1 < compactBuyOrders.length && rows.length < MAX_STEAM_TOOLTIP_ROWS; i += 2) {
+            const salePrice = Number(compactBuyOrders[i]) / 100;
+            const ordersCount = String(compactBuyOrders[i + 1] ?? '').replace(/\s| /g, '');
+
+            if (!isValidPrice(salePrice) || !/\d/.test(ordersCount)) continue;
+
+            rows.push({
+                salePriceText: formatCurrency(salePrice),
+                ordersCount,
+                salePrice
+            });
+        }
+
+        return rows;
+    }
+
+    function findSteamBuyOrdersFromOrderBook(orderBook) {
+        const steamOrderRows = getSteamOrderRowsFromOrderBook(orderBook);
+        const firstRow = steamOrderRows[0];
+        if (!firstRow) return null;
+
+        return {
+            priceText: firstRow.salePriceText,
+            ordersCount: firstRow.ordersCount,
+            steamOrderRows
+        };
+    }
+
+    function fetchSteamOrderBook(appId, marketHashName, operation, onComplete) {
+        const requestUrl = new URL('https://steamcommunity.com/market/orderbook');
+        requestUrl.searchParams.set('q', 'Load');
+        requestUrl.searchParams.set('qp', JSON.stringify([appId, marketHashName]));
+
+        return GM_xmlhttpRequest({
+            method: 'GET',
+            url: requestUrl.toString(),
+            timeout: STEAM_REQUEST_TIMEOUT_MS,
+            headers: {
+                'Accept': 'application/json',
+                'x-valve-request-type': 'queryAction'
+            },
+            onload: function(response) {
+                if (!isOperationActive(operation)) {
+                    if (onComplete) onComplete('cancelled');
+                    return;
+                }
+
+                if (response.status === 429) {
+                    if (onComplete) onComplete(429);
+                    return;
+                }
+
+                if (response.status !== 200) {
+                    if (onComplete) onComplete(response.status);
+                    return;
+                }
+
+                try {
+                    const orderBook = JSON.parse(response.responseText);
+                    if (!orderBook?.success || !orderBook?.data) {
+                        if (onComplete) onComplete('orderbook-error');
+                        return;
+                    }
+
+                    const buyOrders = findSteamBuyOrdersFromOrderBook(orderBook.data);
+                    if (onComplete) onComplete(200, buyOrders ? { status: 'price', buyOrders } : { status: 'no-orders' });
+                } catch (e) {
+                    if (onComplete) onComplete('orderbook-error');
+                }
+            },
+            onerror: function() {
+                if (onComplete) onComplete('error');
+            },
+            ontimeout: function() {
+                if (onComplete) onComplete('timeout');
+            },
+            onabort: function() {
+                if (onComplete) onComplete('cancelled');
+            }
+        });
+    }
+
     function fetchSteamOrderHistogram(itemNameId, operation, onComplete) {
         const requestUrl = new URL('https://steamcommunity.com/market/itemordershistogram');
         requestUrl.searchParams.set('country', 'RU');
@@ -917,7 +1004,7 @@
                         }
                     };
 
-                    const request = fetchSteamPriceFromHTML(task.targetUrl, task.marketHashName, task.targetLinkElement, task.totalCard, operation, finishTask);
+                    const request = fetchSteamPriceFromHTML(task.targetUrl, task.marketHashName, task.appId, task.targetLinkElement, task.totalCard, operation, finishTask);
                     const cleanup = () => {
                         if (completed) return;
                         completed = true;
@@ -1440,9 +1527,11 @@
         }
     }
 
-    function fetchSteamPriceFromHTML(targetUrl, marketHashName, targetLinkElement, totalCard, operation, onComplete) {
+    function fetchSteamPriceFromHTML(targetUrl, marketHashName, appId, targetLinkElement, totalCard, operation, onComplete) {
         const requestUrl = new URL(targetUrl);
         requestUrl.searchParams.set('l', 'russian');
+        let pageRequest = null;
+        let orderBookRequest = null;
         let histogramRequest = null;
         let renderRequest = null;
 
@@ -1551,7 +1640,8 @@
             });
         };
 
-        const request = GM_xmlhttpRequest({
+        const fetchHtmlFallback = () => {
+            pageRequest = GM_xmlhttpRequest({
             method: "GET",
             url: requestUrl.toString(),
             timeout: STEAM_REQUEST_TIMEOUT_MS,
@@ -1647,11 +1737,39 @@
             onabort: function() {
                 if (onComplete) onComplete('cancelled');
             }
-        });
+            });
+        };
+
+        if (appId === 730 || appId === 570) {
+            orderBookRequest = fetchSteamOrderBook(appId, marketHashName, operation, (status, data) => {
+                if (status === 429) {
+                    if (onComplete) onComplete(429);
+                    return;
+                }
+
+                if (status === 200 && data?.status === 'price') {
+                    const result = applySteamBuyOrders(data.buyOrders);
+                    if (onComplete) onComplete(result ? 200 : 'invalid-price', result || undefined);
+                    return;
+                }
+
+                if (status === 200 && data?.status === 'no-orders') {
+                    setCardNoBuyOrders(targetLinkElement, totalCard);
+                    if (onComplete) onComplete(200, { status: 'no-orders' });
+                    return;
+                }
+
+                console.error(`[Profit Calculator Debug] Orderbook failed for "${marketHashName}". Status: ${status}. Falling back to HTML parser.`);
+                fetchHtmlFallback();
+            });
+        } else {
+            fetchHtmlFallback();
+        }
 
         return {
             abort: () => {
-                if (request && typeof request.abort === 'function') request.abort();
+                if (pageRequest && typeof pageRequest.abort === 'function') pageRequest.abort();
+                if (orderBookRequest && typeof orderBookRequest.abort === 'function') orderBookRequest.abort();
                 if (histogramRequest && typeof histogramRequest.abort === 'function') histogramRequest.abort();
                 if (renderRequest && typeof renderRequest.abort === 'function') renderRequest.abort();
             }
