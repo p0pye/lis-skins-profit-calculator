@@ -262,6 +262,16 @@
 
     function normalizeSteamMarketHashName(marketHashName, appId) {
         let normalized = normalizeItemName(marketHashName);
+
+        if (appId === 570) {
+            normalized = normalized.replace(
+                /^(.+?):\s*\d[\d\s,.]*\s+(Inscribed|Strange)\s+Gem$/i,
+                '$2 $1 Gem'
+            );
+
+            return normalizeItemName(normalized);
+        }
+
         if (appId !== 730) return normalized;
 
         normalized = normalized.replace(
@@ -274,6 +284,29 @@
         );
 
         return normalizeItemName(normalized);
+    }
+
+    function getCsExteriorCategoryValue(exteriorText) {
+        const exteriorCategories = {
+            'Factory New': 'WearCategory0',
+            'Minimal Wear': 'WearCategory1',
+            'Field-Tested': 'WearCategory2',
+            'Battle-Scarred': 'WearCategory3',
+            'Well-Worn': 'WearCategory4'
+        };
+
+        return exteriorCategories[exteriorText] || '';
+    }
+
+    function buildSteamListingUrl(appId, marketHashName, totalCard) {
+        const url = new URL(`https://steamcommunity.com/market/listings/${appId}/${encodeSteamMarketHashName(marketHashName)}`);
+
+        if (appId === 730) {
+            const exteriorCategory = getCsExteriorCategoryValue(findCsExteriorText(totalCard));
+            if (exteriorCategory) url.searchParams.set('category_Exterior', exteriorCategory);
+        }
+
+        return url.toString();
     }
 
     function isValidPrice(value) {
@@ -310,33 +343,62 @@
         return cached;
     }
 
-    function findCsWearText(totalCard) {
-        const wearMatch = normalizeItemName(totalCard.textContent).match(/\b(Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\b/i);
-        return wearMatch ? wearMatch[1] : '';
+    function findCsExteriorText(totalCard) {
+        const cardText = normalizeItemName(totalCard.textContent);
+        const fullWearMatch = cardText.match(/\b(Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\b/i);
+        if (fullWearMatch) return fullWearMatch[1];
+
+        const wearAliases = {
+            FN: 'Factory New',
+            MW: 'Minimal Wear',
+            FT: 'Field-Tested',
+            WW: 'Well-Worn',
+            BS: 'Battle-Scarred'
+        };
+        const shortWearMatch = cardText.match(/(?:^|[\s/|])(?:FN|MW|FT|WW|BS)(?=$|[\s/|])/i);
+        if (!shortWearMatch) return '';
+
+        return wearAliases[shortWearMatch[0].replace(/[\s/|]/g, '').toUpperCase()] || '';
     }
 
-    function getMarketHashNameFromCard(totalCard) {
-        const candidates = [];
-        const addCandidate = (value) => {
+    function getMarketHashNameFromCard(totalCard, appId) {
+        const rootCandidates = [];
+        const nestedCandidates = [];
+        const addCandidate = (target, value) => {
             const normalized = normalizeItemName(value);
-            if (normalized) candidates.push(normalized);
+            if (normalized) target.push(normalized);
         };
 
-        ['data-market-hash-name', 'data-name', 'data-title'].forEach(attr => addCandidate(totalCard.getAttribute(attr)));
+        ['data-market-hash-name', 'data-name', 'data-title'].forEach(attr => addCandidate(rootCandidates, totalCard.getAttribute(attr)));
 
         totalCard.querySelectorAll('[data-market-hash-name], [data-name], [data-title], img[alt], img[title], a[title]').forEach(element => {
-            ['data-market-hash-name', 'data-name', 'data-title', 'alt', 'title'].forEach(attr => addCandidate(element.getAttribute(attr)));
+            ['data-market-hash-name', 'data-name', 'data-title', 'alt', 'title'].forEach(attr => addCandidate(nestedCandidates, element.getAttribute(attr)));
         });
 
         const titleElem = totalCard.querySelector('.name, .item-name, .inner-name');
-        addCandidate(titleElem ? titleElem.textContent : '');
+        const titleText = normalizeItemName(titleElem ? titleElem.textContent : '');
 
         const wearPattern = /\((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)$/i;
-        let itemName = candidates.find(candidate => wearPattern.test(candidate)) || candidates.sort((a, b) => b.length - a.length)[0] || '';
-        const wearText = findCsWearText(totalCard);
+        const allCandidates = [...rootCandidates, titleText, ...nestedCandidates].filter(Boolean);
+        let itemName = allCandidates.find(candidate => wearPattern.test(candidate))
+            || rootCandidates[0]
+            || titleText
+            || nestedCandidates.sort((a, b) => b.length - a.length)[0]
+            || '';
 
-        if (wearText && itemName && !wearPattern.test(itemName)) {
-            itemName = `${itemName} (${wearText})`;
+        if (appId === 730) {
+            const cardText = normalizeItemName(totalCard.textContent);
+            const exteriorText = findCsExteriorText(totalCard);
+
+            if (/(?:^|[\s/|])ST™?(?=$|[\s/|])|StatTrak™?/i.test(cardText) && !/^StatTrak™?\s+/i.test(itemName)) {
+                itemName = `StatTrak™ ${itemName}`;
+            } else if (/(?:^|[\s/|])Souvenir(?=$|[\s/|])/i.test(cardText) && !/^Souvenir\s+/i.test(itemName)) {
+                itemName = `Souvenir ${itemName}`;
+            }
+
+            if (exteriorText && !wearPattern.test(itemName)) {
+                itemName = `${itemName} (${exteriorText})`;
+            }
         }
 
         return itemName;
@@ -584,7 +646,7 @@
             if (isValidPrice(parsePriceValue(priceText))) {
                 return {
                     priceText,
-                    ordersCount: resolvedFirstRow?.ordersCount || (!summary?.isSummary ? summary?.ordersCount : '') || '',
+                    ordersCount: resolvedFirstRow?.ordersCount || summary?.ordersCount || '',
                     table: resolvedTable,
                     steamOrderRows: resolvedTable ? undefined : resolvedRows.length > 0 ? resolvedRows : undefined,
                     isSummary: !resolvedTable && resolvedRows.length === 0 && Boolean(summary?.isSummary)
@@ -2059,7 +2121,7 @@
             if (passesDiffFilter) {
                 totalCard.style.display = '';
                 if (!totalCard.querySelector('.steam-highest-buy-order-link[data-lis-helper-badge="true"]')) {
-                    let itemName = getMarketHashNameFromCard(totalCard);
+                    let itemName = getMarketHashNameFromCard(totalCard, currentAppId);
 
                     if (itemName) {
                         const steamLink = document.createElement('a');
@@ -2089,7 +2151,7 @@
                         }
 
                         const steamMarketHashName = normalizeSteamMarketHashName(itemName, currentAppId);
-                        const targetSteamUrl = `https://steamcommunity.com/market/listings/${currentAppId}/${encodeSteamMarketHashName(steamMarketHashName)}`;
+                        const targetSteamUrl = buildSteamListingUrl(currentAppId, steamMarketHashName, totalCard);
                         steamLink.setAttribute('href', targetSteamUrl);
                         totalCard.appendChild(steamLink);
 
