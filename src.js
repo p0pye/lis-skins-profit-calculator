@@ -26,7 +26,7 @@
     const LIS_PAGE_REQUEST_TIMEOUT_MS = 20000;
     const MAX_STEAM_429_REQUEUES = 10;
     const STEAM_CACHE_TTL_MS = 5 * 60 * 1000;
-    const MAX_STEAM_TOOLTIP_ROWS = 10;
+    const MAX_STEAM_TOOLTIP_ROWS = 20;
     const EXCELLENT_PROFIT_PERCENT_THRESHOLD = 30;
     const PROFITABLE_PERCENT_THRESHOLD = 20;
     const PROFIT_COLOR_EXCELLENT = '#16a34a';
@@ -237,7 +237,17 @@
         let value = input ? parseInt(input.value) : parseInt(localStorage.getItem('lis_helper_workers_count'));
 
         if (!value || value < 1) value = 3;
-        if (value > 7) value = 7;
+        if (value > 33) value = 33;
+
+        return value;
+    }
+
+    function getLisPagesConcurrency() {
+        const input = document.getElementById('lis-pages-workers-num-input');
+        let value = input ? parseInt(input.value) : parseInt(localStorage.getItem('lis_helper_pages_workers_count'));
+
+        if (!value || value < 1) value = 4;
+        if (value > 33) value = 33;
 
         return value;
     }
@@ -247,7 +257,7 @@
         let value = input ? parseInt(input.value) : parseInt(localStorage.getItem('lis_helper_tooltip_rows_count'));
 
         if (!value || value < 1) value = 3;
-        if (value > 10) value = 10;
+        if (value > 20) value = 20;
 
         return value;
     }
@@ -1313,6 +1323,7 @@
 
         const savedDiff = localStorage.getItem('lis_helper_min_diff') || '0';
         const savedPages = localStorage.getItem('lis_helper_pages_count') || '2';
+        const savedLisPagesWorkers = localStorage.getItem('lis_helper_pages_workers_count') || '4';
         const savedWorkers = localStorage.getItem('lis_helper_workers_count') || '3';
         const savedTooltipRows = localStorage.getItem('lis_helper_tooltip_rows_count') || '3';
 
@@ -1356,8 +1367,8 @@
             <div class="lis-setting-row">
                 <label>Страниц LIS:</label>
                 <div class="lis-number-control">
-                    <input type="number" id="pages-num-input" min="1" max="99" value="${savedPages}" style="
-                        width: 50px; background: ${COLOR_PANEL_FIELD_BG}; color: ${COLOR_PANEL_SECONDARY_ACCENT}; border: 1px solid ${COLOR_PANEL_BORDER};
+                    <input type="number" id="pages-num-input" min="1" max="999" value="${Math.min(parseInt(savedPages), 999)}" style="
+                        width: 60px; background: ${COLOR_PANEL_FIELD_BG}; color: ${COLOR_PANEL_SECONDARY_ACCENT}; border: 1px solid ${COLOR_PANEL_BORDER};
                         padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
                     ">
                     <div class="lis-stepper-buttons">
@@ -1367,14 +1378,32 @@
                 </div>
                 <span class="lis-help" data-tooltip="Сколько страниц LIS загрузить для поиска.">?</span>
             </div>
-            <input type="range" id="pages-to-load" min="1" max="99" value="${savedPages}" style="
+            <input type="range" id="pages-to-load" min="1" max="999" value="${Math.min(parseInt(savedPages), 999)}" style="
                 width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${COLOR_PANEL_SECONDARY_ACCENT};
+            ">
+
+            <div class="lis-setting-row">
+                <label>Потоков LIS:</label>
+                <div class="lis-number-control">
+                    <input type="number" id="lis-pages-workers-num-input" min="1" max="33" value="${Math.min(parseInt(savedLisPagesWorkers), 33)}" style="
+                        width: 50px; background: ${COLOR_PANEL_FIELD_BG}; color: ${PROFIT_COLOR_NEUTRAL}; border: 1px solid ${COLOR_PANEL_BORDER};
+                        padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
+                    ">
+                    <div class="lis-stepper-buttons">
+                        <button type="button" class="lis-stepper" data-step-target="lis-pages-workers-num-input" data-step-delta="1">▲</button>
+                        <button type="button" class="lis-stepper" data-step-target="lis-pages-workers-num-input" data-step-delta="-1">▼</button>
+                    </div>
+                </div>
+                <span class="lis-help" data-tooltip="Сколько страниц LIS загружать одновременно. Высокое значение повышает нагрузку на сайт.">?</span>
+            </div>
+            <input type="range" id="lis-pages-workers-to-load" min="1" max="33" value="${Math.min(parseInt(savedLisPagesWorkers), 33)}" style="
+                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${PROFIT_COLOR_NEUTRAL};
             ">
 
             <div class="lis-setting-row">
                 <label>Запросов Steam:</label>
                 <div class="lis-number-control">
-                    <input type="number" id="workers-num-input" min="1" max="7" value="${Math.min(parseInt(savedWorkers), 7)}" style="
+                    <input type="number" id="workers-num-input" min="1" max="33" value="${Math.min(parseInt(savedWorkers), 33)}" style="
                         width: 50px; background: ${COLOR_PANEL_FIELD_BG}; color: ${COLOR_PANEL_SUCCESS_ACCENT}; border: 1px solid ${COLOR_PANEL_BORDER};
                         padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
                     ">
@@ -1385,14 +1414,14 @@
                 </div>
                 <span class="lis-help" data-tooltip="Сколько запросов к Steam делать одновременно. Высокое значение повышает риск блокировки.">?</span>
             </div>
-            <input type="range" id="workers-to-load" min="1" max="7" value="${Math.min(parseInt(savedWorkers), 7)}" style="
+            <input type="range" id="workers-to-load" min="1" max="33" value="${Math.min(parseInt(savedWorkers), 33)}" style="
                 width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${COLOR_PANEL_SUCCESS_ACCENT};
             ">
 
             <div class="lis-setting-row">
                 <label>Строк в таблице:</label>
                 <div class="lis-number-control">
-                    <input type="number" id="tooltip-rows-num-input" min="1" max="10" value="${Math.min(parseInt(savedTooltipRows), 10)}" style="
+                    <input type="number" id="tooltip-rows-num-input" min="1" max="20" value="${Math.min(parseInt(savedTooltipRows), 20)}" style="
                         width: 50px; background: ${COLOR_PANEL_FIELD_BG}; color: ${COLOR_PANEL_ACCENT}; border: 1px solid ${COLOR_PANEL_BORDER};
                         padding: 2px 4px; border-radius: 4px; font-weight: bold; text-align: center;
                     ">
@@ -1403,7 +1432,7 @@
                 </div>
                 <span class="lis-help" data-tooltip="Сколько заявок Steam показывать в таблице при наведении на плашку.">?</span>
             </div>
-            <input type="range" id="tooltip-rows-to-load" min="1" max="10" value="${Math.min(parseInt(savedTooltipRows), 10)}" style="
+            <input type="range" id="tooltip-rows-to-load" min="1" max="20" value="${Math.min(parseInt(savedTooltipRows), 20)}" style="
                 width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${COLOR_PANEL_ACCENT};
             ">
 
@@ -1418,6 +1447,8 @@
 
             const pagesSlider = document.getElementById('pages-to-load');
             const pagesNumber = document.getElementById('pages-num-input');
+            const lisPagesWorkersSlider = document.getElementById('lis-pages-workers-to-load');
+            const lisPagesWorkersNumber = document.getElementById('lis-pages-workers-num-input');
             const diffSlider = document.getElementById('min-diff-input');
             const diffNumber = document.getElementById('diff-num-input');
             const workersSlider = document.getElementById('workers-to-load');
@@ -1477,7 +1508,7 @@
                 });
             });
 
-            [diffNumber, diffSlider, pagesNumber, pagesSlider, workersNumber, workersSlider, tooltipRowsNumber, tooltipRowsSlider].forEach(input => {
+            [diffNumber, diffSlider, pagesNumber, pagesSlider, lisPagesWorkersNumber, lisPagesWorkersSlider, workersNumber, workersSlider, tooltipRowsNumber, tooltipRowsSlider].forEach(input => {
                 input.addEventListener('wheel', function(event) {
                     event.preventDefault();
                     stepInputValue(this, event.deltaY < 0 ? 1 : -1);
@@ -1490,9 +1521,20 @@
             });
             pagesNumber.addEventListener('input', function() {
                 let val = parseInt(this.value) || 1;
-                if (val > 99) val = 99; if (val < 1) val = 1;
+                if (val > 999) val = 999; if (val < 1) val = 1;
                 pagesSlider.value = val;
                 localStorage.setItem('lis_helper_pages_count', val);
+            });
+            lisPagesWorkersSlider.addEventListener('input', function() {
+                lisPagesWorkersNumber.value = this.value;
+                localStorage.setItem('lis_helper_pages_workers_count', this.value);
+            });
+            lisPagesWorkersNumber.addEventListener('input', function() {
+                let val = parseInt(this.value) || 4;
+                if (val > 33) val = 33; if (val < 1) val = 1;
+                this.value = val;
+                lisPagesWorkersSlider.value = val;
+                localStorage.setItem('lis_helper_pages_workers_count', val);
             });
 
             diffSlider.addEventListener('input', function() {
@@ -1511,7 +1553,7 @@
             });
             workersNumber.addEventListener('input', function() {
                 let val = parseInt(this.value) || 3;
-                if (val > 7) val = 7; if (val < 1) val = 1;
+                if (val > 33) val = 33; if (val < 1) val = 1;
                 this.value = val;
                 workersSlider.value = val;
                 localStorage.setItem('lis_helper_workers_count', val);
@@ -1522,7 +1564,7 @@
             });
             tooltipRowsNumber.addEventListener('input', function() {
                 let val = parseInt(this.value) || 3;
-                if (val > 10) val = 10; if (val < 1) val = 1;
+                if (val > 20) val = 20; if (val < 1) val = 1;
                 this.value = val;
                 tooltipRowsSlider.value = val;
                 localStorage.setItem('lis_helper_tooltip_rows_count', val);
@@ -1745,31 +1787,27 @@
             });
         };
 
-        if (appId === 730 || appId === 570) {
-            orderBookRequest = fetchSteamOrderBook(appId, marketHashName, operation, (status, data) => {
-                if (status === 429) {
-                    if (onComplete) onComplete(429);
-                    return;
-                }
+        orderBookRequest = fetchSteamOrderBook(appId, marketHashName, operation, (status, data) => {
+            if (status === 429) {
+                if (onComplete) onComplete(429);
+                return;
+            }
 
-                if (status === 200 && data?.status === 'price') {
-                    const result = applySteamBuyOrders(data.buyOrders);
-                    if (onComplete) onComplete(result ? 200 : 'invalid-price', result || undefined);
-                    return;
-                }
+            if (status === 200 && data?.status === 'price') {
+                const result = applySteamBuyOrders(data.buyOrders);
+                if (onComplete) onComplete(result ? 200 : 'invalid-price', result || undefined);
+                return;
+            }
 
-                if (status === 200 && data?.status === 'no-orders') {
-                    setCardNoBuyOrders(targetLinkElement, totalCard);
-                    if (onComplete) onComplete(200, { status: 'no-orders' });
-                    return;
-                }
+            if (status === 200 && data?.status === 'no-orders') {
+                setCardNoBuyOrders(targetLinkElement, totalCard);
+                if (onComplete) onComplete(200, { status: 'no-orders' });
+                return;
+            }
 
-                console.error(`[Profit Calculator Debug] Orderbook failed for "${marketHashName}". Status: ${status}. Falling back to HTML parser.`);
-                fetchHtmlFallback();
-            });
-        } else {
+            console.error(`[Profit Calculator Debug] Orderbook failed for "${marketHashName}". Status: ${status}. Falling back to HTML parser.`);
             fetchHtmlFallback();
-        }
+        });
 
         return {
             abort: () => {
@@ -2335,7 +2373,7 @@
 
         let pagesCount = parseInt(document.getElementById('pages-num-input').value) || 1;
 
-        pagesCount = Math.min(pagesCount, 99);
+        pagesCount = Math.min(pagesCount, 999);
 
         const gridContainer = document.querySelector('.skins-market-skins-list');
         if (!gridContainer) {
@@ -2352,6 +2390,7 @@
 
         const baseUrl = window.location.origin + window.location.pathname;
         const searchParams = new URLSearchParams(window.location.search);
+        const lisPagesConcurrency = getLisPagesConcurrency();
         operation.lisProgress = {
             total: pagesCount - 1,
             completed: 0,
@@ -2359,11 +2398,11 @@
             startedAt: Date.now()
         };
 
-        for (let p = 2; p <= pagesCount; p++) {
-            searchParams.set('page', p);
-            const targetUrl = `${baseUrl}?${searchParams.toString()}`;
+        const loadLisPage = async (pageNumber) => {
+            const pageSearchParams = new URLSearchParams(searchParams);
+            pageSearchParams.set('page', pageNumber);
+            const targetUrl = `${baseUrl}?${pageSearchParams.toString()}`;
             if (!isOperationActive(operation)) return;
-            updateLisProgress(operation);
 
             let cleanup = null;
             let requestTimedOut = false;
@@ -2380,43 +2419,77 @@
                 operation.cleanups.add(cleanup);
 
                 const response = await fetch(targetUrl, { signal: controller.signal });
-                if (!isOperationActive(operation)) return;
+                if (!isOperationActive(operation)) return { page: pageNumber, cancelled: true };
 
                 if (!response.ok) throw new Error();
                 const htmlText = await response.text();
                 clearTimeout(timeoutId);
                 operation.cleanups.delete(cleanup);
-                if (!isOperationActive(operation)) return;
+                if (!isOperationActive(operation)) return { page: pageNumber, cancelled: true };
 
                 const parser = new DOMParser();
                 const doc = parser.parseFromString(htmlText, 'text/html');
                 const remoteCards = doc.querySelectorAll('.skins-market-skins-list > .item');
 
-                let addedInThisPage = 0;
-                remoteCards.forEach(card => {
+                const cards = Array.from(remoteCards).map(card => {
                     const clonedCard = card.cloneNode(true);
                     clonedCard.classList.add('loaded-by-script');
-                    gridContainer.appendChild(clonedCard);
-                    addedInThisPage++;
+                    return clonedCard;
                 });
-                operation.lisProgress.completed++;
-                if (addedInThisPage === 0) break;
+
+                return { page: pageNumber, cards };
             } catch (err) {
                 if (cleanup) {
                     cleanup();
                     operation.cleanups.delete(cleanup);
                 }
-                if (!isOperationActive(operation)) return;
+                if (!isOperationActive(operation)) return { page: pageNumber, cancelled: true };
 
-                if (requestTimedOut) {
-                    showErrorToast(`Страница ${p} LIS не ответила за ${LIS_PAGE_REQUEST_TIMEOUT_MS / 1000} секунд.`);
-                    statusDiv.innerText = `Таймаут LIS на странице ${p}. Обрабатываем загруженное.`;
-                } else {
-                    showErrorToast(`Не удалось загрузить страницу ${p} LIS.`);
-                    statusDiv.innerText = `Ошибка LIS на странице ${p}. Обрабатываем загруженное.`;
-                }
-                break;
+                return {
+                    page: pageNumber,
+                    error: true,
+                    timedOut: requestTimedOut
+                };
             }
+        };
+
+        const pagesToLoad = Array.from({ length: pagesCount - 1 }, (_, index) => index + 2);
+
+        for (let start = 0; start < pagesToLoad.length; start += lisPagesConcurrency) {
+            if (!isOperationActive(operation)) return;
+            updateLisProgress(operation);
+
+            const batch = pagesToLoad.slice(start, start + lisPagesConcurrency);
+            const results = await Promise.all(batch.map(loadLisPage));
+            if (!isOperationActive(operation)) return;
+
+            let shouldStopLoading = false;
+            results
+                .sort((a, b) => a.page - b.page)
+                .forEach(result => {
+                    if (shouldStopLoading || result.cancelled) return;
+
+                    if (result.error) {
+                        if (result.timedOut) {
+                            showErrorToast(`Страница ${result.page} LIS не ответила за ${LIS_PAGE_REQUEST_TIMEOUT_MS / 1000} секунд.`);
+                            statusDiv.innerText = `Таймаут LIS на странице ${result.page}. Обрабатываем загруженное.`;
+                        } else {
+                            showErrorToast(`Не удалось загрузить страницу ${result.page} LIS.`);
+                            statusDiv.innerText = `Ошибка LIS на странице ${result.page}. Обрабатываем загруженное.`;
+                        }
+                        shouldStopLoading = true;
+                        return;
+                    }
+
+                    result.cards.forEach(card => gridContainer.appendChild(card));
+                    operation.lisProgress.completed++;
+
+                    if (result.cards.length === 0) {
+                        shouldStopLoading = true;
+                    }
+                });
+
+            if (shouldStopLoading) break;
         }
 
         if (!isOperationActive(operation)) return;
