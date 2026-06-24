@@ -24,9 +24,12 @@
     const STEAM_GAME_FEE_RATE = 0.10;
     const STEAM_REQUEST_TIMEOUT_MS = 20000;
     const LIS_PAGE_REQUEST_TIMEOUT_MS = 20000;
+    const LIS_PAGE_MAX_RETRIES = 2;
+    const LIS_PAGE_RETRY_DELAY_MS = 1000;
     const MAX_STEAM_429_REQUEUES = 10;
     const STEAM_CACHE_TTL_MS = 5 * 60 * 1000;
     const MAX_STEAM_TOOLTIP_ROWS = 20;
+    const LIS_EARLY_STEAM_PROCESS_CARD_THRESHOLD = 1000;
     const EXCELLENT_PROFIT_PERCENT_THRESHOLD = 30;
     const PROFITABLE_PERCENT_THRESHOLD = 20;
     const PROFIT_COLOR_EXCELLENT = '#16a34a';
@@ -115,6 +118,7 @@
         document.querySelectorAll('.skins-market-skins-list > .item.loaded-by-script').forEach(card => card.remove());
         document.querySelectorAll('.skins-market-skins-list > .item').forEach(card => {
             card.removeAttribute('data-calculated-profit');
+            card.removeAttribute('data-calculated-profit-percent');
             card.style.display = '';
         });
     }
@@ -177,7 +181,7 @@
     function completeSteamTask(operation) {
         operation.steamProgress.completed++;
 
-        if (operation.steamProgress.completed % 10 === 0) {
+        if (operation.steamProgress.completed % operation.steamProgress.sortEvery === 0) {
             sortCardsByProfit(false);
         }
 
@@ -240,6 +244,10 @@
         if (value > 33) value = 33;
 
         return value;
+    }
+
+    function getSteamSortBatchSize(workersCount) {
+        return Math.max(10, Math.round((workersCount / 33) * 330));
     }
 
     function getLisPagesConcurrency() {
@@ -347,15 +355,17 @@
 
     function setCardPriceError(targetLinkElement, totalCard, message) {
         targetLinkElement.innerText = message;
-        targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
+        targetLinkElement.style.setProperty('background', PROFIT_COLOR_NEGATIVE, 'important');
         totalCard.setAttribute('data-calculated-profit', -999999);
+        totalCard.removeAttribute('data-calculated-profit-percent');
         setSteamBreakdown(targetLinkElement);
     }
 
     function setCardNoBuyOrders(targetLinkElement, totalCard) {
         targetLinkElement.innerText = 'Нет заявок';
-        targetLinkElement.style.background = COLOR_NO_ORDERS;
+        targetLinkElement.style.setProperty('background', COLOR_NO_ORDERS, 'important');
         totalCard.setAttribute('data-calculated-profit', -999999);
+        totalCard.removeAttribute('data-calculated-profit-percent');
         setSteamBreakdown(targetLinkElement);
     }
 
@@ -931,7 +941,7 @@
         });
     }
 
-    async function processNextSteamRequest(operation) {
+    async function processNextSteamRequest(operation, finalize = true) {
         if (isQueueRunning) return;
         isQueueRunning = true;
 
@@ -941,7 +951,8 @@
             completed: 0,
             startedAt: Date.now(),
             pausedMs: 0,
-            pauseStartedAt: null
+            pauseStartedAt: null,
+            sortEvery: getSteamSortBatchSize(concurrency)
         };
         updateSteamProgress(operation);
 
@@ -983,9 +994,10 @@
                     const breakdownRows = calculateSteamBreakdownRows(cached.steamOrderRows, lisPrice);
 
                     task.targetLinkElement.innerText = formatPriceWithProfit(cached.priceText, task.targetLinkElement, cached.ordersCount);
-                    task.totalCard.setAttribute('data-calculated-profit', calculatedProfit);
+                    setCardCalculatedProfit(task.totalCard, calculatedProfit, lisPrice);
                     setSteamBreakdown(task.targetLinkElement, breakdownRows);
-                    applyProfitBadgeColor(task.targetLinkElement, calculatedProfit);
+                    applyProfitBadgeColor(task.targetLinkElement, calculatedProfit, getProfitPercentFromCard(task.totalCard));
+                    removeCardBelowProfitThreshold(task.totalCard);
                     completeSteamTask(operation);
 
                     continue;
@@ -1011,14 +1023,15 @@
                             if (task.retry429Count <= MAX_STEAM_429_REQUEUES) {
                                 steamRequestsQueue.unshift(task);
                                 task.targetLinkElement.innerText = `Пауза Steam ${task.retry429Count}/${MAX_STEAM_429_REQUEUES}`;
-                                task.targetLinkElement.style.background = COLOR_PAUSED;
+                                task.targetLinkElement.style.setProperty('background', COLOR_PAUSED, 'important');
                                 sortCardsByProfit();
                                 await pauseSteamGlobally(operation);
                             } else {
                                 console.error(`[Profit Calculator Error] Достигнут лимит повторов 429 для "${task.marketHashName}"`);
                                 task.targetLinkElement.innerText = 'Лимит повторов';
-                                task.targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
+                                task.targetLinkElement.style.setProperty('background', PROFIT_COLOR_NEGATIVE, 'important');
                                 task.totalCard.setAttribute('data-calculated-profit', -999999);
+                                task.totalCard.removeAttribute('data-calculated-profit-percent');
                                 completeSteamTask(operation);
                             }
                             resolve();
@@ -1050,10 +1063,16 @@
 
         const workers = Array(concurrency).fill(null).map(() => worker());
         await Promise.all(workers);
+        isQueueRunning = false;
 
         if (!isOperationActive(operation)) return;
 
-        sortCardsByProfit();
+        sortCardsByProfit(finalize);
+        if (!finalize) {
+            operation.steamProgress = null;
+            return;
+        }
+
         const summary = formatResultStats();
         showSuccessToast(summary);
 
@@ -1652,9 +1671,10 @@
             }
 
             const calculatedProfit = calculateNetProfit(steamPrice, lisPrice);
-            totalCard.setAttribute('data-calculated-profit', calculatedProfit);
+            setCardCalculatedProfit(totalCard, calculatedProfit, lisPrice);
             setSteamBreakdown(targetLinkElement, breakdownRows);
-            applyProfitBadgeColor(targetLinkElement, calculatedProfit);
+            applyProfitBadgeColor(targetLinkElement, calculatedProfit, getProfitPercentFromCard(totalCard));
+            removeCardBelowProfitThreshold(totalCard);
 
             return {
                 status: 'price',
@@ -1667,8 +1687,9 @@
         const showParserError = (reason, status = 'parser-error') => {
             console.error(`[Profit Calculator Parser Error] ${reason} for "${marketHashName}"`);
             targetLinkElement.innerText = "Ответ Steam не распознан";
-            targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
+            targetLinkElement.style.setProperty('background', PROFIT_COLOR_NEGATIVE, 'important');
             totalCard.setAttribute('data-calculated-profit', -999999);
+            totalCard.removeAttribute('data-calculated-profit-percent');
             if (onComplete) onComplete(status);
         };
 
@@ -1755,7 +1776,9 @@
                     console.error(`[Profit Calculator Error] Код ${response.status} для "${marketHashName}"`);
                     showErrorToast(`Steam заблокировал запрос (Код ${response.status}). Сделайте паузу.`);
                     targetLinkElement.innerText = `Блок ${response.status}`;
-                    targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
+                    targetLinkElement.style.setProperty('background', PROFIT_COLOR_NEGATIVE, 'important');
+                    totalCard.setAttribute('data-calculated-profit', -999999);
+                    totalCard.removeAttribute('data-calculated-profit-percent');
                     if (onComplete) onComplete(response.status);
                     return;
                 }
@@ -1801,8 +1824,9 @@
                 } catch (e) {
                     console.error(`[Profit Calculator Error] Сбой обработки DOM для "${marketHashName}":`, e);
                     targetLinkElement.innerText = "Страница Steam изменилась";
-                    targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
+                    targetLinkElement.style.setProperty('background', PROFIT_COLOR_NEGATIVE, 'important');
                     totalCard.setAttribute('data-calculated-profit', -999999);
+                    totalCard.removeAttribute('data-calculated-profit-percent');
                     if (onComplete) onComplete('error');
                 }
 
@@ -1814,8 +1838,9 @@
                 }
                 console.error(`[Profit Calculator Network Error] Сбой сети для "${marketHashName}":`, err);
                 targetLinkElement.innerText = "Ошибка сети";
-                targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
+                targetLinkElement.style.setProperty('background', PROFIT_COLOR_NEGATIVE, 'important');
                 totalCard.setAttribute('data-calculated-profit', -999999);
+                totalCard.removeAttribute('data-calculated-profit-percent');
                 if (onComplete) onComplete('error');
             },
             ontimeout: function() {
@@ -1825,8 +1850,9 @@
                 }
                 console.error(`[Profit Calculator Timeout] Steam не ответил за ${STEAM_REQUEST_TIMEOUT_MS / 1000}с для "${marketHashName}"`);
                 targetLinkElement.innerText = "Steam не ответил";
-                targetLinkElement.style.background = PROFIT_COLOR_NEGATIVE;
+                targetLinkElement.style.setProperty('background', PROFIT_COLOR_NEGATIVE, 'important');
                 totalCard.setAttribute('data-calculated-profit', -999999);
+                totalCard.removeAttribute('data-calculated-profit-percent');
                 if (onComplete) onComplete('timeout');
             },
             onabort: function() {
@@ -1984,6 +2010,16 @@
 
     function calculateNetProfit(steamPrice, lisPrice) {
         return calculateSteamSale(steamPrice, lisPrice).netProfit;
+    }
+
+    function setCardCalculatedProfit(totalCard, profit, lisPrice) {
+        totalCard.setAttribute('data-calculated-profit', profit);
+
+        if (isValidPrice(lisPrice) && profit !== null && Number.isFinite(profit)) {
+            totalCard.setAttribute('data-calculated-profit-percent', (profit / lisPrice) * 100);
+        } else {
+            totalCard.removeAttribute('data-calculated-profit-percent');
+        }
     }
 
     function formatCurrency(value) {
@@ -2197,11 +2233,25 @@
     }
 
     function getProfitPercentFromCard(card) {
+        const storedProfitPercent = parseFloat(card.getAttribute('data-calculated-profit-percent'));
+        if (Number.isFinite(storedProfitPercent)) return storedProfitPercent;
+
         const badge = card.querySelector('.steam-highest-buy-order-link[data-lis-helper-badge="true"]');
         if (!badge) return null;
 
         const profit = getValidProfit(card);
         return getProfitPercentFromBadge(badge, profit);
+    }
+
+    function removeCardBelowProfitThreshold(card) {
+        const profitPercent = getProfitPercentFromCard(card);
+
+        if (profitPercent !== null && profitPercent < getProfitDeleteThreshold()) {
+            card.remove();
+            return true;
+        }
+
+        return false;
     }
 
     function isVisibleCard(card) {
@@ -2253,21 +2303,34 @@
         return `Готово: карточек ${stats.total}, выгодных ${stats.profitable}, ошибок ${stats.errors}, без заявок ${stats.noOrders}`;
     }
 
-    function applyProfitBadgeColor(badge, profit) {
-        const profitPercent = getProfitPercentFromBadge(badge, profit);
+    function getProfitStateByPercent(profitPercent) {
+        if (profitPercent === null || !Number.isFinite(profitPercent)) return 'neutral';
+        if (profitPercent < 0) return 'bad';
+        if (profitPercent > EXCELLENT_PROFIT_PERCENT_THRESHOLD) return 'excellent';
+        if (profitPercent >= PROFITABLE_PERCENT_THRESHOLD) return 'good';
+
+        return 'neutral';
+    }
+
+    function setBadgeBackground(badge, color) {
+        badge.style.setProperty('background', color, 'important');
+    }
+
+    function applyProfitBadgeColor(badge, profit, knownProfitPercent = null) {
+        const profitPercent = knownProfitPercent ?? getProfitPercentFromBadge(badge, profit);
 
         if (badge.innerText === 'Загружаю') {
-            badge.style.background = COLOR_LOADING;
+            setBadgeBackground(badge, COLOR_LOADING);
         } else if (badge.innerText.startsWith('Пауза Steam')) {
-            badge.style.background = COLOR_PAUSED;
+            setBadgeBackground(badge, COLOR_PAUSED);
         } else if (badge.innerText === 'Нет заявок') {
-            badge.style.background = COLOR_NO_ORDERS;
+            setBadgeBackground(badge, COLOR_NO_ORDERS);
         } else if (isErrorBadgeText(badge.innerText || '')) {
-            badge.style.background = PROFIT_COLOR_NEGATIVE;
+            setBadgeBackground(badge, PROFIT_COLOR_NEGATIVE);
         } else if (profitPercent !== null) {
-            badge.style.background = getProfitColorByState(getProfitState(profitPercent, 100));
+            setBadgeBackground(badge, getProfitColorByState(getProfitStateByPercent(profitPercent)));
         } else {
-            badge.style.background = PROFIT_COLOR_NEUTRAL;
+            setBadgeBackground(badge, PROFIT_COLOR_NEUTRAL);
         }
     }
 
@@ -2277,7 +2340,7 @@
             if (!badge) return;
 
             const profit = getValidProfit(card);
-            applyProfitBadgeColor(badge, profit);
+            applyProfitBadgeColor(badge, profit, getProfitPercentFromCard(card));
         });
     }
 
@@ -2288,17 +2351,10 @@
 
         if (updateStatus && statusDiv) statusDiv.innerText = "Сортирую по выгоде";
 
-        const deleteThreshold = getProfitDeleteThreshold();
         let cardsArray = Array.from(gridContainer.querySelectorAll('.skins-market-skins-list > .item'));
 
         cardsArray = cardsArray.filter(card => {
-            const profitPercent = getProfitPercentFromCard(card);
-            if (profitPercent !== null && profitPercent < deleteThreshold) {
-                card.remove();
-                return false;
-            }
-
-            return true;
+            return !removeCardBelowProfitThreshold(card);
         });
 
         cardsArray.sort((a, b) => {
@@ -2314,9 +2370,10 @@
         if (updateStatus && statusDiv) statusDiv.innerText = "Готово";
     }
 
-    function applyDiffFilter(operation) {
+    function applyDiffFilter(operation, options = {}) {
         if (!isOperationActive(operation)) return;
 
+        const startSteamQueue = options.startSteamQueue !== false;
         const minVal = parseFloat(document.getElementById('diff-num-input').value) || 0;
         const allCards = document.querySelectorAll('.skins-market-skins-list .item');
 
@@ -2391,11 +2448,27 @@
 
         const queuedCount = steamRequestsQueue.length;
 
-        if (queuedCount > 0 && !isQueueRunning && isOperationActive(operation)) {
+        if (startSteamQueue && queuedCount > 0 && !isQueueRunning && isOperationActive(operation)) {
             processNextSteamRequest(operation);
         }
 
         return queuedCount;
+    }
+
+    async function processLoadedCardsChunk(operation, statusText = 'Проверяю загруженные карточки') {
+        if (!isOperationActive(operation)) return 0;
+
+        const statusDiv = document.getElementById('combine-status');
+        if (statusDiv) statusDiv.innerText = statusText;
+
+        const queuedCount = applyDiffFilter(operation, { startSteamQueue: false });
+        if (queuedCount > 0 && isOperationActive(operation)) {
+            await processNextSteamRequest(operation, false);
+        } else {
+            sortCardsByProfit(false);
+        }
+
+        return queuedCount || 0;
     }
 
     function finishAfterDiffFilter(operation, queuedCount) {
@@ -2450,6 +2523,7 @@
         const baseUrl = window.location.origin + window.location.pathname;
         const searchParams = new URLSearchParams(window.location.search);
         const lisPagesConcurrency = getLisPagesConcurrency();
+        let cardsPendingSteamProcess = gridContainer.querySelectorAll('.skins-market-skins-list > .item').length;
         operation.lisProgress = {
             total: pagesCount - 1,
             completed: 0,
@@ -2463,52 +2537,59 @@
             const targetUrl = `${baseUrl}?${pageSearchParams.toString()}`;
             if (!isOperationActive(operation)) return;
 
-            let cleanup = null;
-            let requestTimedOut = false;
-            try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => {
-                    requestTimedOut = true;
-                    controller.abort();
-                }, LIS_PAGE_REQUEST_TIMEOUT_MS);
-                cleanup = () => {
+            for (let attempt = 1; attempt <= LIS_PAGE_MAX_RETRIES + 1; attempt++) {
+                let cleanup = null;
+                let requestTimedOut = false;
+                try {
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => {
+                        requestTimedOut = true;
+                        controller.abort();
+                    }, LIS_PAGE_REQUEST_TIMEOUT_MS);
+                    cleanup = () => {
+                        clearTimeout(timeoutId);
+                        controller.abort();
+                    };
+                    operation.cleanups.add(cleanup);
+
+                    const response = await fetch(targetUrl, { signal: controller.signal });
+                    if (!isOperationActive(operation)) return { page: pageNumber, cancelled: true };
+
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    const htmlText = await response.text();
                     clearTimeout(timeoutId);
-                    controller.abort();
-                };
-                operation.cleanups.add(cleanup);
-
-                const response = await fetch(targetUrl, { signal: controller.signal });
-                if (!isOperationActive(operation)) return { page: pageNumber, cancelled: true };
-
-                if (!response.ok) throw new Error();
-                const htmlText = await response.text();
-                clearTimeout(timeoutId);
-                operation.cleanups.delete(cleanup);
-                if (!isOperationActive(operation)) return { page: pageNumber, cancelled: true };
-
-                const parser = new DOMParser();
-                const doc = parser.parseFromString(htmlText, 'text/html');
-                const remoteCards = doc.querySelectorAll('.skins-market-skins-list > .item');
-
-                const cards = Array.from(remoteCards).map(card => {
-                    const clonedCard = card.cloneNode(true);
-                    clonedCard.classList.add('loaded-by-script');
-                    return clonedCard;
-                });
-
-                return { page: pageNumber, cards };
-            } catch (err) {
-                if (cleanup) {
-                    cleanup();
                     operation.cleanups.delete(cleanup);
-                }
-                if (!isOperationActive(operation)) return { page: pageNumber, cancelled: true };
+                    if (!isOperationActive(operation)) return { page: pageNumber, cancelled: true };
 
-                return {
-                    page: pageNumber,
-                    error: true,
-                    timedOut: requestTimedOut
-                };
+                    const parser = new DOMParser();
+                    const doc = parser.parseFromString(htmlText, 'text/html');
+                    const remoteCards = doc.querySelectorAll('.skins-market-skins-list > .item');
+
+                    const cards = Array.from(remoteCards).map(card => {
+                        const clonedCard = card.cloneNode(true);
+                        clonedCard.classList.add('loaded-by-script');
+                        return clonedCard;
+                    });
+
+                    return { page: pageNumber, cards };
+                } catch (err) {
+                    if (cleanup) {
+                        cleanup();
+                        operation.cleanups.delete(cleanup);
+                    }
+                    if (!isOperationActive(operation)) return { page: pageNumber, cancelled: true };
+
+                    if (attempt <= LIS_PAGE_MAX_RETRIES) {
+                        await waitForOperation(operation, LIS_PAGE_RETRY_DELAY_MS);
+                        continue;
+                    }
+
+                    return {
+                        page: pageNumber,
+                        error: true,
+                        timedOut: requestTimedOut
+                    };
+                }
             }
         };
 
@@ -2530,23 +2611,29 @@
 
                     if (result.error) {
                         if (result.timedOut) {
-                            showErrorToast(`Страница ${result.page} LIS не ответила за ${LIS_PAGE_REQUEST_TIMEOUT_MS / 1000} секунд.`);
-                            statusDiv.innerText = `Таймаут LIS на странице ${result.page}. Обрабатываем загруженное.`;
+                            showErrorToast(`Страница ${result.page} LIS не ответила после ${LIS_PAGE_MAX_RETRIES + 1} попыток.`);
+                            statusDiv.innerText = `Таймаут LIS на странице ${result.page}. Пропускаем страницу.`;
                         } else {
-                            showErrorToast(`Не удалось загрузить страницу ${result.page} LIS.`);
-                            statusDiv.innerText = `Ошибка LIS на странице ${result.page}. Обрабатываем загруженное.`;
+                            showErrorToast(`Не удалось загрузить страницу ${result.page} LIS после ${LIS_PAGE_MAX_RETRIES + 1} попыток.`);
+                            statusDiv.innerText = `Ошибка LIS на странице ${result.page}. Пропускаем страницу.`;
                         }
-                        shouldStopLoading = true;
                         return;
                     }
 
                     result.cards.forEach(card => gridContainer.appendChild(card));
+                    cardsPendingSteamProcess += result.cards.length;
                     operation.lisProgress.completed++;
 
                     if (result.cards.length === 0) {
                         shouldStopLoading = true;
                     }
                 });
+
+            if (cardsPendingSteamProcess > LIS_EARLY_STEAM_PROCESS_CARD_THRESHOLD) {
+                await processLoadedCardsChunk(operation, `Загружено больше ${LIS_EARLY_STEAM_PROCESS_CARD_THRESHOLD} карточек. Проверяю цены.`);
+                cardsPendingSteamProcess = 0;
+                if (!isOperationActive(operation)) return;
+            }
 
             if (shouldStopLoading) break;
         }
