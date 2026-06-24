@@ -274,6 +274,11 @@
 
         if (appId !== 730) return normalized;
 
+        normalized = normalized.replace(/\s+\(Not Painted\)$/i, '');
+        normalized = normalized.replace(/^StatTrak™?\s+★\s+/i, '★ StatTrak™ ');
+        normalized = normalized.replace(/^Souvenir\s+★\s+/i, '★ Souvenir ');
+        normalized = normalized.replace(/^Souvenir\s+(.+\s+Souvenir\s+Package)$/i, '$1');
+
         normalized = normalized.replace(
             /\b(Gamma Doppler)\s+(Emerald|Phase\s*[1-4])(?=\s*(?:\(|$))/i,
             '$1'
@@ -2159,7 +2164,7 @@
     }
 
     function formatResultStats(stats = getResultStats()) {
-        return `Готово: ${stats.total} карточек, выгодных ${stats.profitable}, ошибок ${stats.errors}, без заявок ${stats.noOrders}`;
+        return `Готово: карточек ${stats.total}, выгодных ${stats.profitable}, ошибок ${stats.errors}, без заявок ${stats.noOrders}`;
     }
 
     function applyProfitBadgeColor(badge, profit) {
