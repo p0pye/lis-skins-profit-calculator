@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         lis-skins-profit-calculator
 // @namespace    http://tampermonkey.net
-// @version      15.1
+// @version      15.2
 // @description  lis-skins-profit-calculator
 // @author       p0pye + AI Helper
 // @match        https://lis-skins.com/*/market/*
