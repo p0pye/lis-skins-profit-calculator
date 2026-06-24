@@ -6,7 +6,7 @@ Userscript для LIS-SKINS, который ищет потенциально в
 
 - Загружает дополнительные страницы LIS-SKINS прямо из панели.
 - Фильтрует карточки по минимальной скидке.
-- Получает заявки Steam для CS2 и Dota 2 через новый `/market/orderbook`.
+- Получает заявки Steam для CS2, Dota 2 и Rust через новый `/market/orderbook`.
 - Для остальных случаев использует HTML/Steam fallback-парсеры.
 - Учитывает категории CS2: `StatTrak`, `Souvenir`, exterior `FN/MW/FT/WW/BS`.
 - Собирает корректные ссылки Steam для grouped market pages.
@@ -34,6 +34,7 @@ https://lis-skins.com/*/market/*
 
 - **Скидка, от %** - минимальная скидка LIS. При `0` показываются все карточки.
 - **Страниц LIS** - сколько страниц загрузить.
+- **Потоков LIS** - сколько страниц LIS загружать одновременно.
 - **Запросов Steam** - число параллельных запросов к Steam. Чем выше значение, тем выше риск временной блокировки.
 - **Строк в таблице** - сколько строк заявок Steam показывать в tooltip-таблице.
 
@@ -41,7 +42,7 @@ https://lis-skins.com/*/market/*
 
 ## Как берутся цены Steam
 
-Для CS2 (`appid=730`) и Dota 2 (`appid=570`) скрипт сначала использует новый endpoint Steam:
+Скрипт сначала использует новый endpoint Steam:
 
 ```text
 GET https://steamcommunity.com/market/orderbook?q=Load&qp=[appid,"market hash name"]
