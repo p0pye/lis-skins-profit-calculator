@@ -28,6 +28,7 @@
     const LIS_PAGE_RETRY_DELAY_MS = 1000;
     const MAX_STEAM_429_REQUEUES = 10;
     const STEAM_CACHE_TTL_MS = 5 * 60 * 1000;
+    const MAX_STEAM_CACHE_ENTRIES = 3000;
     const MAX_STEAM_TOOLTIP_ROWS = 20;
     const LIS_EARLY_STEAM_PROCESS_CARD_THRESHOLD = 1000;
     const EXCELLENT_PROFIT_PERCENT_THRESHOLD = 30;
@@ -57,6 +58,7 @@
     const COLOR_HELP_SHADOW = 'rgba(0,0,0,0.45)';
     const COLOR_TOOLTIP_SHADOW = 'rgba(0,0,0,0.55)';
     const COLOR_BADGE_SHADOW = 'rgba(0,0,0,0.3)';
+    const CANCEL_BUTTON_TEXT = 'Остановить';
 
     function createOperation() {
         currentOperation = {
@@ -81,11 +83,125 @@
         if (isLoading) {
             btn.classList.remove('lis-btn-disabled');
             btn.classList.add('lis-btn-cancel');
-            btn.innerHTML = `<span class="lis-spinner"></span>Отмена`;
+            btn.innerHTML = `
+                <span id="lis-overall-progress-bar" class="lis-btn-progress-bar"></span>
+                <span class="lis-btn-content"><span class="lis-spinner"></span><span id="lis-overall-progress-text">${CANCEL_BUTTON_TEXT} 0%</span></span>
+            `;
         } else {
             btn.classList.remove('lis-btn-disabled', 'lis-btn-cancel');
             btn.innerText = 'Найти выгодные';
         }
+    }
+
+    function updateOverallProgress(percent, label = '') {
+        const progressBar = document.getElementById('lis-overall-progress-bar');
+        const progressText = document.getElementById('lis-overall-progress-text');
+        if (!progressBar || !progressText) return;
+
+        const normalizedPercent = Math.max(0, Math.min(100, Math.round(percent)));
+        progressBar.style.width = `${normalizedPercent}%`;
+        progressText.innerText = `${CANCEL_BUTTON_TEXT} ${label || `${normalizedPercent}%`}`;
+    }
+
+    function hideOverallProgress() {
+        const progressBar = document.getElementById('lis-overall-progress-bar');
+        const progressText = document.getElementById('lis-overall-progress-text');
+        if (!progressBar || !progressText) return;
+
+        progressBar.style.width = '0%';
+        progressText.innerText = `${CANCEL_BUTTON_TEXT} 0%`;
+    }
+
+    function getOperationProgress(operation) {
+        const progress = operation?.overallProgress;
+        if (!progress) return { completed: 0, total: 0, percent: 0, etaText: '' };
+
+        const completed = progress.lisCompleted + progress.retryCompleted + progress.steamCompleted;
+        const rawTotal = progress.lisTotal + progress.retryTotal + progress.steamTotal;
+        const total = Math.max(rawTotal, completed);
+        const lisRatio = progress.lisTotal > 0
+            ? Math.min(progress.lisCompleted / progress.lisTotal, 1)
+            : 1;
+        const retryRatio = progress.retryTotal > 0
+            ? Math.min(progress.retryCompleted / progress.retryTotal, 1)
+            : 0;
+        const steamRatio = progress.steamTotal > 0
+            ? Math.min(progress.steamCompleted / progress.steamTotal, 1)
+            : 0;
+        const hasLisPhase = progress.lisTotal > 0;
+        const hasRetryPhase = progress.retryTotal > 0;
+        const lisWeight = hasLisPhase ? (hasRetryPhase ? 35 : 40) : 0;
+        const retryWeight = hasRetryPhase ? 10 : 0;
+        const steamWeight = 100 - lisWeight - retryWeight;
+        const rawPercent = hasLisPhase
+            ? (lisRatio * lisWeight) + (retryRatio * retryWeight) + (steamRatio * steamWeight)
+            : (total > 0 ? Math.min((completed / total) * 100, 100) : 0);
+        const nextPercent = Math.min(rawPercent, 99);
+        const percent = Math.max(progress.lastPercent || 0, nextPercent);
+        progress.lastPercent = percent;
+        const activeSteamPauseMs = operation?.steamProgress?.pauseStartedAt
+            ? Date.now() - operation.steamProgress.pauseStartedAt
+            : 0;
+        const pausedSteamMs = operation?.steamProgress?.pausedMs || 0;
+        const elapsedMs = operation?.overallProgress?.startedAt
+            ? Math.max(Date.now() - operation.overallProgress.startedAt - pausedSteamMs - activeSteamPauseMs, 0)
+            : 0;
+        const remaining = Math.max(total - completed, 0);
+        const etaText = completed > 0 && remaining > 0
+            ? `, примерно ${formatDuration((elapsedMs / completed) * remaining)}`
+            : '';
+
+        return { completed, total, percent, etaText };
+    }
+
+    function getOperationStatusText(operation) {
+        if (!operation?.overallProgress) return '';
+
+        const parts = [];
+        if (operation.lisProgress && !operation.lisProgress.isRetry) {
+            const total = operation.lisProgress.total;
+            const completed = operation.lisProgress.completed;
+            const remaining = Math.max(total - completed, 0);
+            const pendingCards = operation.lisProgress.cardsPendingSteamProcess || 0;
+            const cardsUntilProcessing = Math.max(LIS_EARLY_STEAM_PROCESS_CARD_THRESHOLD - pendingCards + 1, 0);
+            const cardsText = cardsUntilProcessing > 0
+                ? `, до обработки ${cardsUntilProcessing} ${pluralizeRu(cardsUntilProcessing, 'карточка', 'карточки', 'карточек')}`
+                : ', обработка вот-вот начнется';
+            parts.push(`LIS ${Math.min(completed + 2, operation.lisProgress.pagesCount)}/${operation.lisProgress.pagesCount}, осталось ${remaining}${cardsText}`);
+        }
+
+        if (operation.lisProgress?.isRetry) {
+            const total = operation.lisProgress.total;
+            const completed = operation.lisProgress.completed;
+            const remaining = Math.max(total - completed, 0);
+            parts.push(`повтор LIS ${completed}/${total}, осталось ${remaining}`);
+        }
+
+        if (operation.steamProgress) {
+            const total = operation.steamProgress.total;
+            const completed = operation.steamProgress.completed;
+            const current = Math.min(completed + 1, total);
+            const remaining = Math.max(total - completed, 0);
+            const prefix = operation.steamStatusPrefix || 'Steam';
+            if (parts.length > 0) parts.push('');
+            parts.push(`${prefix} ${current}/${total}, осталось ${remaining}`);
+        }
+
+        const { etaText } = getOperationProgress(operation);
+        return `${parts.join('\n')}${etaText}`;
+    }
+
+    function updateOperationStatus(operation) {
+        if (!isOperationActive(operation)) return;
+
+        const { percent } = getOperationProgress(operation);
+        updateOverallProgress(percent, `${Math.round(percent)}%`);
+
+        const statusDiv = document.getElementById('combine-status');
+        if (!statusDiv) return;
+
+        const statusText = getOperationStatusText(operation);
+        if (statusText) statusDiv.innerText = statusText;
     }
 
     function finishOperation(operation, statusText = '') {
@@ -95,6 +211,7 @@
         isQueueRunning = false;
         steamRequestsQueue = [];
         setStartButtonLoading(false);
+        hideOverallProgress();
 
         const statusDiv = document.getElementById('combine-status');
         if (statusDiv && statusText) statusDiv.innerText = statusText;
@@ -119,6 +236,7 @@
         document.querySelectorAll('.skins-market-skins-list > .item').forEach(card => {
             card.removeAttribute('data-calculated-profit');
             card.removeAttribute('data-calculated-profit-percent');
+            card.removeAttribute('data-lis-helper-filtered');
             card.style.display = '';
         });
     }
@@ -160,22 +278,12 @@
     function updateSteamProgress(operation, prefix = 'Steam') {
         if (!isOperationActive(operation) || !operation.steamProgress) return;
 
-        const statusDiv = document.getElementById('combine-status');
-        if (!statusDiv) return;
-
-        const total = operation.steamProgress.total;
         const completed = operation.steamProgress.completed;
-        const current = Math.min(completed + 1, total);
-        const remaining = Math.max(total - completed, 0);
-        const activePauseMs = operation.steamProgress.pauseStartedAt
-            ? Date.now() - operation.steamProgress.pauseStartedAt
-            : 0;
-        const elapsedMs = Math.max(Date.now() - operation.steamProgress.startedAt - operation.steamProgress.pausedMs - activePauseMs, 0);
-        const etaText = completed > 0 && remaining > 0
-            ? `, примерно ${formatDuration((elapsedMs / completed) * remaining)}`
-            : '';
-
-        statusDiv.innerText = `${prefix}: ${current}/${total}, осталось ${remaining}${etaText}`;
+        if (operation.overallProgress) {
+            operation.overallProgress.steamCompleted = operation.steamProgress.completedOffset + completed;
+        }
+        operation.steamStatusPrefix = prefix;
+        updateOperationStatus(operation);
     }
 
     function completeSteamTask(operation) {
@@ -197,22 +305,33 @@
         return `${minutes} мин ${seconds} сек`;
     }
 
+    function pluralizeRu(value, one, few, many) {
+        const absValue = Math.abs(value);
+        const lastTwoDigits = absValue % 100;
+        const lastDigit = absValue % 10;
+
+        if (lastTwoDigits >= 11 && lastTwoDigits <= 14) return many;
+        if (lastDigit === 1) return one;
+        if (lastDigit >= 2 && lastDigit <= 4) return few;
+
+        return many;
+    }
+
     function updateLisProgress(operation) {
         if (!isOperationActive(operation) || !operation.lisProgress) return;
 
-        const statusDiv = document.getElementById('combine-status');
-        if (!statusDiv) return;
-
         const total = operation.lisProgress.total;
         const completed = operation.lisProgress.completed;
-        const currentPage = Math.min(completed + 2, operation.lisProgress.pagesCount);
-        const remaining = Math.max(total - completed, 0);
-        const elapsedMs = Date.now() - operation.lisProgress.startedAt;
-        const etaText = completed > 0 && remaining > 0
-            ? `, примерно ${formatDuration((elapsedMs / completed) * remaining)}`
-            : '';
-
-        statusDiv.innerText = `LIS: ${currentPage}/${operation.lisProgress.pagesCount}, осталось ${remaining}${etaText}`;
+        if (operation.overallProgress) {
+            if (operation.lisProgress.isRetry) {
+                operation.overallProgress.retryTotal = total;
+                operation.overallProgress.retryCompleted = completed;
+            } else {
+                operation.overallProgress.lisTotal = total;
+                operation.overallProgress.lisCompleted = completed;
+            }
+        }
+        updateOperationStatus(operation);
     }
 
     function pauseSteamGlobally(operation) {
@@ -312,7 +431,7 @@
         normalized = normalized.replace(/\s+\(Not Painted\)$/i, '');
         normalized = normalized.replace(/^StatTrak™?\s+★\s+/i, '★ StatTrak™ ');
         normalized = normalized.replace(/^Souvenir\s+★\s+/i, '★ Souvenir ');
-        normalized = normalized.replace(/^Souvenir\s+(.+\s+Souvenir\s+Package)$/i, '$1');
+        normalized = normalized.replace(/^Souvenir\s+(.+\s+Souvenir\s+(?:Highlight\s+)?Package)$/i, '$1');
 
         normalized = normalized.replace(
             /\b(Gamma Doppler)\s+(Emerald|Phase\s*[1-4])(?=\s*(?:\(|$))/i,
@@ -371,6 +490,28 @@
 
     function getSteamCacheKey(appId, marketHashName) {
         return `${appId}:${marketHashName}`;
+    }
+
+    function pruneSteamCache() {
+        const now = Date.now();
+        for (const [cacheKey, cached] of steamCache.entries()) {
+            if (!Number.isFinite(cached.fetchedAt) || now - cached.fetchedAt >= STEAM_CACHE_TTL_MS) {
+                steamCache.delete(cacheKey);
+            }
+        }
+
+        while (steamCache.size > MAX_STEAM_CACHE_ENTRIES) {
+            steamCache.delete(steamCache.keys().next().value);
+        }
+    }
+
+    function setSteamCache(cacheKey, data) {
+        if (steamCache.has(cacheKey)) steamCache.delete(cacheKey);
+        steamCache.set(cacheKey, {
+            ...data,
+            fetchedAt: Date.now()
+        });
+        pruneSteamCache();
     }
 
     function getFreshSteamCache(cacheKey) {
@@ -946,9 +1087,13 @@
         isQueueRunning = true;
 
         const concurrency = getWorkersCount();
+        const steamTasksTotal = steamRequestsQueue.length;
+        const steamCompletedOffset = operation.overallProgress ? operation.overallProgress.steamCompleted : 0;
+        if (operation.overallProgress) operation.overallProgress.steamTotal += steamTasksTotal;
         operation.steamProgress = {
-            total: steamRequestsQueue.length,
+            total: steamTasksTotal,
             completed: 0,
+            completedOffset: steamCompletedOffset,
             startedAt: Date.now(),
             pausedMs: 0,
             pauseStartedAt: null,
@@ -1037,10 +1182,7 @@
                             resolve();
                         } else {
                             if (status === 200 && data) {
-                                steamCache.set(cacheKey, {
-                                    ...data,
-                                    fetchedAt: Date.now()
-                                });
+                                setSteamCache(cacheKey, data);
                             }
                             const delay = 1200 + Math.random() * 800;
                             await waitForOperation(operation, delay);
@@ -1165,6 +1307,25 @@
             .lis-btn-cancel {
                 background: ${PROFIT_COLOR_NEGATIVE} !important;
                 cursor: pointer !important;
+                position: relative !important;
+                overflow: hidden !important;
+                min-height: 32px !important;
+            }
+            .lis-btn-progress-bar {
+                position: absolute;
+                inset: 0 auto 0 0;
+                width: 0%;
+                background: ${PROFIT_COLOR_EXCELLENT};
+                opacity: 0.85;
+                transition: width 180ms ease;
+                pointer-events: none;
+            }
+            .lis-btn-content {
+                position: relative;
+                z-index: 1;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
             }
             .lis-panel-header {
                 display: flex;
@@ -2183,6 +2344,8 @@
             if (tooltip) return;
             if (hoverTimer) clearTimeout(hoverTimer);
             hoverTimer = setTimeout(() => {
+                if (!document.contains(badge)) return;
+
                 const rowsRaw = badge.getAttribute('data-steam-breakdown');
                 if (!rowsRaw) return;
 
@@ -2349,7 +2512,7 @@
         const statusDiv = document.getElementById('combine-status');
         if (!gridContainer) return;
 
-        if (updateStatus && statusDiv) statusDiv.innerText = "Сортирую по выгоде";
+        if (updateStatus && statusDiv && !currentOperation) statusDiv.innerText = "Сортирую по выгоде";
 
         let cardsArray = Array.from(gridContainer.querySelectorAll('.skins-market-skins-list > .item'));
 
@@ -2364,10 +2527,12 @@
             return (profitPercentB ?? -999998) - (profitPercentA ?? -999998);
         });
 
-        cardsArray.forEach(card => gridContainer.appendChild(card));
+        const sortedCardsFragment = document.createDocumentFragment();
+        cardsArray.forEach(card => sortedCardsFragment.appendChild(card));
+        gridContainer.appendChild(sortedCardsFragment);
         updateProfitBadgeColors(cardsArray);
 
-        if (updateStatus && statusDiv) statusDiv.innerText = "Готово";
+        if (updateStatus && statusDiv && !currentOperation) statusDiv.innerText = "Готово";
     }
 
     function applyDiffFilter(operation, options = {}) {
@@ -2375,7 +2540,9 @@
 
         const startSteamQueue = options.startSteamQueue !== false;
         const minVal = parseFloat(document.getElementById('diff-num-input').value) || 0;
-        const allCards = document.querySelectorAll('.skins-market-skins-list .item');
+        const allCards = Array.from(document.querySelectorAll('.skins-market-skins-list > .item'))
+            .filter(card => !card.hasAttribute('data-lis-helper-filtered')
+                && !card.querySelector('.steam-highest-buy-order-link[data-lis-helper-badge="true"]'));
 
         let currentAppId = 252490; // По умолчанию Rust
         const currentUrl = window.location.href;
@@ -2397,6 +2564,7 @@
 
             if (passesDiffFilter) {
                 totalCard.style.display = '';
+                totalCard.removeAttribute('data-lis-helper-filtered');
                 if (!totalCard.querySelector('.steam-highest-buy-order-link[data-lis-helper-badge="true"]')) {
                     let itemName = getMarketHashNameFromCard(totalCard, currentAppId);
 
@@ -2439,10 +2607,17 @@
                             targetLinkElement: steamLink,
                             totalCard: totalCard
                         });
+                    } else if (totalCard.classList.contains('loaded-by-script')) {
+                        totalCard.remove();
                     }
                 }
             } else {
-                totalCard.style.display = 'none';
+                if (totalCard.classList.contains('loaded-by-script')) {
+                    totalCard.remove();
+                } else {
+                    totalCard.style.display = 'none';
+                    totalCard.setAttribute('data-lis-helper-filtered', 'true');
+                }
             }
         });
 
@@ -2455,11 +2630,8 @@
         return queuedCount;
     }
 
-    async function processLoadedCardsChunk(operation, statusText = 'Проверяю загруженные карточки') {
+    async function processLoadedCardsChunk(operation) {
         if (!isOperationActive(operation)) return 0;
-
-        const statusDiv = document.getElementById('combine-status');
-        if (statusDiv) statusDiv.innerText = statusText;
 
         const queuedCount = applyDiffFilter(operation, { startSteamQueue: false });
         if (queuedCount > 0 && isOperationActive(operation)) {
@@ -2487,8 +2659,7 @@
             return;
         }
 
-        const statusDiv = document.getElementById('combine-status');
-        if (statusDiv) statusDiv.innerText = `Steam: старт`;
+        updateOperationStatus(operation);
     }
 
     async function loadMorePages() {
@@ -2501,11 +2672,22 @@
         const statusDiv = document.getElementById('combine-status');
 
         setStartButtonLoading(true);
+        updateOverallProgress(0);
+        pruneSteamCache();
         resetAnalysisResults();
 
         let pagesCount = parseInt(document.getElementById('pages-num-input').value) || 1;
 
         pagesCount = Math.min(pagesCount, 999);
+        operation.overallProgress = {
+            lisTotal: Math.max(pagesCount - 1, 0),
+            lisCompleted: 0,
+            retryTotal: 0,
+            retryCompleted: 0,
+            steamTotal: 0,
+            steamCompleted: 0,
+            startedAt: Date.now()
+        };
 
         const gridContainer = document.querySelector('.skins-market-skins-list');
         if (!gridContainer) {
@@ -2515,7 +2697,7 @@
 
         if (pagesCount <= 1) {
             const queuedCount = applyDiffFilter(operation);
-            if (isOperationActive(operation)) statusDiv.innerText = "Проверяю карточки";
+            if (isOperationActive(operation)) updateOperationStatus(operation);
             finishAfterDiffFilter(operation, queuedCount);
             return;
         }
@@ -2528,6 +2710,7 @@
             total: pagesCount - 1,
             completed: 0,
             pagesCount,
+            cardsPendingSteamProcess,
             startedAt: Date.now()
         };
 
@@ -2570,6 +2753,7 @@
                         clonedCard.classList.add('loaded-by-script');
                         return clonedCard;
                     });
+                    if (doc.documentElement) doc.documentElement.textContent = '';
 
                     return { page: pageNumber, cards };
                 } catch (err) {
@@ -2593,53 +2777,113 @@
             }
         };
 
-        const pagesToLoad = Array.from({ length: pagesCount - 1 }, (_, index) => index + 2);
-
-        for (let start = 0; start < pagesToLoad.length; start += lisPagesConcurrency) {
-            if (!isOperationActive(operation)) return;
-            updateLisProgress(operation);
-
-            const batch = pagesToLoad.slice(start, start + lisPagesConcurrency);
-            const results = await Promise.all(batch.map(loadLisPage));
-            if (!isOperationActive(operation)) return;
-
-            let shouldStopLoading = false;
-            results
-                .sort((a, b) => a.page - b.page)
-                .forEach(result => {
-                    if (shouldStopLoading || result.cancelled) return;
-
-                    if (result.error) {
-                        if (result.timedOut) {
-                            showErrorToast(`Страница ${result.page} LIS не ответила после ${LIS_PAGE_MAX_RETRIES + 1} попыток.`);
-                            statusDiv.innerText = `Таймаут LIS на странице ${result.page}. Пропускаем страницу.`;
-                        } else {
-                            showErrorToast(`Не удалось загрузить страницу ${result.page} LIS после ${LIS_PAGE_MAX_RETRIES + 1} попыток.`);
-                            statusDiv.innerText = `Ошибка LIS на странице ${result.page}. Пропускаем страницу.`;
-                        }
-                        return;
-                    }
-
-                    result.cards.forEach(card => gridContainer.appendChild(card));
-                    cardsPendingSteamProcess += result.cards.length;
-                    operation.lisProgress.completed++;
-
-                    if (result.cards.length === 0) {
-                        shouldStopLoading = true;
-                    }
-                });
-
-            if (cardsPendingSteamProcess > LIS_EARLY_STEAM_PROCESS_CARD_THRESHOLD) {
-                await processLoadedCardsChunk(operation, `Загружено больше ${LIS_EARLY_STEAM_PROCESS_CARD_THRESHOLD} карточек. Проверяю цены.`);
-                cardsPendingSteamProcess = 0;
-                if (!isOperationActive(operation)) return;
+        let nextPageToLoad = 2;
+        let firstEmptyPageNumber = Infinity;
+        const failedLisPagesQueue = [];
+        let loadedCardsProcessingPromise = null;
+        const processLoadedCardsIfNeeded = async () => {
+            if (cardsPendingSteamProcess <= LIS_EARLY_STEAM_PROCESS_CARD_THRESHOLD) return;
+            if (loadedCardsProcessingPromise) {
+                await loadedCardsProcessingPromise;
+                return;
             }
 
-            if (shouldStopLoading) break;
+            cardsPendingSteamProcess = 0;
+            operation.lisProgress.cardsPendingSteamProcess = cardsPendingSteamProcess;
+            loadedCardsProcessingPromise = processLoadedCardsChunk(operation).finally(() => {
+                loadedCardsProcessingPromise = null;
+            });
+
+            await loadedCardsProcessingPromise;
+        };
+
+        const handleLisPageResult = async (result, options = {}) => {
+            if (!result || result.cancelled || !isOperationActive(operation)) return;
+
+            operation.lisProgress.completed++;
+
+            if (result.error) {
+                if (result.timedOut) {
+                    showErrorToast(`Страница ${result.page} LIS не ответила после ${LIS_PAGE_MAX_RETRIES + 1} попыток.`);
+                } else {
+                    showErrorToast(`Не удалось загрузить страницу ${result.page} LIS после ${LIS_PAGE_MAX_RETRIES + 1} попыток.`);
+                }
+                if (options.queueFailedPages) failedLisPagesQueue.push(result.page);
+                updateLisProgress(operation);
+                return;
+            }
+
+            if (!options.isRetry && result.page >= firstEmptyPageNumber) {
+                updateLisProgress(operation);
+                return;
+            }
+
+            const cardsFragment = document.createDocumentFragment();
+            result.cards.forEach(card => cardsFragment.appendChild(card));
+            gridContainer.appendChild(cardsFragment);
+            cardsPendingSteamProcess += result.cards.length;
+            operation.lisProgress.cardsPendingSteamProcess = cardsPendingSteamProcess;
+
+            if (result.cards.length === 0) {
+                if (!options.isRetry) {
+                    firstEmptyPageNumber = Math.min(firstEmptyPageNumber, result.page);
+                    operation.lisProgress.total = Math.min(operation.lisProgress.total, operation.lisProgress.completed);
+                }
+                updateLisProgress(operation);
+                return;
+            }
+
+            updateLisProgress(operation);
+            await processLoadedCardsIfNeeded();
+        };
+
+        const lisPageWorker = async () => {
+            while (isOperationActive(operation)) {
+                const pageNumber = nextPageToLoad++;
+                if (pageNumber > pagesCount || pageNumber >= firstEmptyPageNumber) return;
+
+                updateLisProgress(operation);
+                const result = await loadLisPage(pageNumber);
+                await handleLisPageResult(result, { queueFailedPages: true });
+            }
+        };
+
+        const lisWorkers = Array(Math.min(lisPagesConcurrency, pagesCount - 1)).fill(null).map(() => lisPageWorker());
+        await Promise.all(lisWorkers);
+
+        if (failedLisPagesQueue.length > 0 && isOperationActive(operation)) {
+            let retryQueueIndex = 0;
+            operation.lisProgress = {
+                total: failedLisPagesQueue.length,
+                completed: 0,
+                pagesCount,
+                cardsPendingSteamProcess,
+                startedAt: Date.now(),
+                isRetry: true
+            };
+            updateLisProgress(operation);
+
+            const retryLisPageWorker = async () => {
+                while (isOperationActive(operation)) {
+                    const pageNumber = failedLisPagesQueue[retryQueueIndex++];
+                    if (!pageNumber) return;
+
+                    updateLisProgress(operation);
+                    const result = await loadLisPage(pageNumber);
+                    await handleLisPageResult(result, { isRetry: true });
+                }
+            };
+
+            const retryWorkers = Array(Math.min(lisPagesConcurrency, failedLisPagesQueue.length)).fill(null).map(() => retryLisPageWorker());
+            await Promise.all(retryWorkers);
+        }
+
+        if (loadedCardsProcessingPromise) {
+            await loadedCardsProcessingPromise;
         }
 
         if (!isOperationActive(operation)) return;
-        statusDiv.innerText = "Проверяю карточки";
+        updateOperationStatus(operation);
 
         const queuedCount = applyDiffFilter(operation);
         finishAfterDiffFilter(operation, queuedCount);
