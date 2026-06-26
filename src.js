@@ -5,6 +5,8 @@
 // @description  lis-skins-profit-calculator
 // @author       p0pye + AI Helper
 // @match        https://lis-skins.com/*/market/*
+// @match        https://avan.market/market*
+// @match        https://avan.market/*/market*
 // @icon         https://www.google.com/s2/favicons?domain=lis-skins.com&sz=64
 // @grant        GM_xmlhttpRequest
 // @connect      steamcommunity.com
@@ -59,6 +61,11 @@
     const COLOR_TOOLTIP_SHADOW = 'rgba(0,0,0,0.55)';
     const COLOR_BADGE_SHADOW = 'rgba(0,0,0,0.3)';
     const CANCEL_BUTTON_TEXT = 'Остановить';
+    const LIS_CARD_SELECTOR = '.skins-market-skins-list > .item';
+    const AVAN_CARD_SELECTOR = '[class*="marketArticlesContainer"] > [class*="cardHovered"]';
+    const MARKET_CARD_SELECTOR = `${LIS_CARD_SELECTOR}, ${AVAN_CARD_SELECTOR}`;
+    const AVAN_API_URL = 'https://avan.market/v1/api/users/catalog';
+    const STEAM_IMAGE_BASE_URL = 'https://steamcommunity-a.akamaihd.net/economy/image/';
 
     function createOperation() {
         currentOperation = {
@@ -167,14 +174,14 @@
             const cardsText = cardsUntilProcessing > 0
                 ? `, до обработки ${cardsUntilProcessing} ${pluralizeRu(cardsUntilProcessing, 'карточка', 'карточки', 'карточек')}`
                 : ', обработка вот-вот начнется';
-            parts.push(`LIS ${Math.min(completed + 2, operation.lisProgress.pagesCount)}/${operation.lisProgress.pagesCount}, осталось ${remaining}${cardsText}`);
+            parts.push(`Сайт ${Math.min(completed + 2, operation.lisProgress.pagesCount)}/${operation.lisProgress.pagesCount}, осталось ${remaining}${cardsText}`);
         }
 
         if (operation.lisProgress?.isRetry) {
             const total = operation.lisProgress.total;
             const completed = operation.lisProgress.completed;
             const remaining = Math.max(total - completed, 0);
-            parts.push(`повтор LIS ${completed}/${total}, осталось ${remaining}`);
+            parts.push(`повтор сайта ${completed}/${total}, осталось ${remaining}`);
         }
 
         if (operation.steamProgress) {
@@ -232,8 +239,8 @@
 
     function resetAnalysisResults() {
         document.querySelectorAll('.steam-highest-buy-order-link[data-lis-helper-badge="true"]').forEach(badge => badge.remove());
-        document.querySelectorAll('.skins-market-skins-list > .item.loaded-by-script').forEach(card => card.remove());
-        document.querySelectorAll('.skins-market-skins-list > .item').forEach(card => {
+        getMarketCards().filter(card => card.classList.contains('loaded-by-script')).forEach(card => card.remove());
+        getMarketCards().forEach(card => {
             card.removeAttribute('data-calculated-profit');
             card.removeAttribute('data-calculated-profit-percent');
             card.removeAttribute('data-lis-helper-filtered');
@@ -524,6 +531,251 @@
         }
 
         return cached;
+    }
+
+    function isAvanMarketPage() {
+        return window.location.hostname === 'avan.market';
+    }
+
+    function getMarketGridContainer(root = document) {
+        return root.querySelector('.skins-market-skins-list')
+            || root.querySelector('[class*="marketArticlesContainer"]');
+    }
+
+    function getMarketCards(root = document) {
+        if (root?.matches?.('.skins-market-skins-list, [class*="marketArticlesContainer"]')) {
+            return Array.from(root.querySelectorAll(':scope > .item, :scope > [class*="cardHovered"]'));
+        }
+
+        return Array.from(root.querySelectorAll(MARKET_CARD_SELECTOR));
+    }
+
+    function isAvanMarketCard(card) {
+        return Boolean(card?.matches?.(AVAN_CARD_SELECTOR) || card?.className?.includes?.('cardHovered'));
+    }
+
+    function getCardPriceElement(card) {
+        return card.querySelector('.price')
+            || card.querySelector('[class*="marketGunCardPrice"] span')
+            || card.querySelector('[class*="marketGunCardPrice"]');
+    }
+
+    function parseMarketPrice(text) {
+        return parseFloat(String(text || '').replace(/[^0-9.,]/g, '').replace(',', '.'));
+    }
+
+    function getCardDiffPercent(card) {
+        const elem = card.querySelector('.steam-price-discount');
+        if (!elem && !isAvanMarketCard(card)) return null;
+
+        if (elem) {
+            const rawValue = elem.getAttribute('data-diff-value') || elem.textContent || '';
+            const attrValue = parseFloat(rawValue.replace('%', '').replace(',', '.'));
+            return Number.isFinite(attrValue) ? attrValue : null;
+        }
+
+        const cardText = normalizeItemName(
+            Array.from(card.querySelectorAll('*'))
+                .filter(element => !element.closest('.steam-highest-buy-order-link[data-lis-helper-badge="true"]'))
+                .map(element => element.childNodes.length === 1 ? element.textContent : '')
+                .join(' ')
+        );
+        const discountMatches = Array.from(cardText.matchAll(/-([0-9]+(?:[.,][0-9]+)?)\s*%/g));
+        const discountValues = discountMatches
+            .map(match => parseFloat(match[1].replace(',', '.')))
+            .filter(Number.isFinite);
+
+        return discountValues.length > 0 ? Math.max(...discountValues) : null;
+    }
+
+    function getCurrentAppId() {
+        const currentUrl = window.location.href;
+        const currentPath = window.location.pathname;
+        const gameParam = new URLSearchParams(window.location.search).get('game') || '';
+        if (currentUrl.includes('/dota2/') || currentPath.includes('/market/dota2') || gameParam === 'dota2') return 570;
+        if (currentUrl.includes('/rust/') || currentPath.includes('/market/rust') || gameParam === 'rust') return 252490;
+        if (currentUrl.includes('/cs2/') || currentUrl.includes('/csgo/') || currentPath.includes('/market/cs') || gameParam === 'cs') return 730;
+
+        return isAvanMarketPage() ? 730 : 252490;
+    }
+
+    function getAvanCurrencyId() {
+        const queryCurrency = new URLSearchParams(window.location.search).get('currency');
+        if (queryCurrency) return queryCurrency;
+
+        const pageText = document.body?.textContent || '';
+        if (pageText.includes('₽')) return '2';
+        if (pageText.includes('$')) return '1';
+
+        return '2';
+    }
+
+    function formatAvanPrice(value) {
+        const numberValue = Number(value);
+        if (!Number.isFinite(numberValue)) return '';
+        const currencyId = getAvanCurrencyId();
+        const isDecimalCurrency = ['1', '3', '5'].includes(String(currencyId));
+        const currencySymbol = String(currencyId) === '1' ? '$' : '₽';
+
+        return `${numberValue.toLocaleString('ru-RU', {
+            minimumFractionDigits: isDecimalCurrency ? 2 : 0,
+            maximumFractionDigits: isDecimalCurrency ? 2 : 0
+        })} ${currencySymbol}`;
+    }
+
+    function getAvanBestSellItem(item) {
+        return Array.isArray(item?.sell_items) && item.sell_items.length > 0
+            ? item.sell_items[0]
+            : null;
+    }
+
+    function getAvanDiscountPercent(item) {
+        const sellItem = getAvanBestSellItem(item);
+        const sellPrice = Number(sellItem?.sell_price);
+        const steamPrice = Number(item?.steam_price);
+
+        if (!Number.isFinite(sellPrice) || !Number.isFinite(steamPrice) || steamPrice <= 0) return null;
+
+        const discount = ((steamPrice - sellPrice) / steamPrice) * 100;
+        return Number.isFinite(discount) ? discount : null;
+    }
+
+    function getAvanGameSlug(appId = getCurrentAppId()) {
+        if (Number(appId) === 570) return 'dota2';
+        if (Number(appId) === 252490) return 'rust';
+
+        return 'cs';
+    }
+
+    function getAvanLocalePrefix() {
+        return window.location.pathname.startsWith('/en/') ? '/en' : '';
+    }
+
+    function getAvanItemUrl(item) {
+        if (!item?.slugified_name) return '';
+
+        return `${getAvanLocalePrefix()}/market/${getAvanGameSlug(item.app_id)}/${item.slugified_name}`;
+    }
+
+    function getAvanCartItems() {
+        try {
+            const value = JSON.parse(localStorage.getItem('cartItems') || '[]');
+            return Array.isArray(value) ? value : [];
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function setAvanCartItems(items) {
+        const value = JSON.stringify(items);
+        localStorage.setItem('cartItems', value);
+        try {
+            window.dispatchEvent(new StorageEvent('storage', {
+                key: 'cartItems',
+                newValue: value
+            }));
+        } catch (e) {
+            window.dispatchEvent(new Event('storage'));
+        }
+    }
+
+    function toggleAvanCartItem(sellItemId, button) {
+        if (!sellItemId) return;
+
+        const cartItems = new Set(getAvanCartItems());
+        if (cartItems.has(sellItemId)) {
+            cartItems.delete(sellItemId);
+            button.innerText = 'В КОРЗИНУ';
+        } else {
+            if (cartItems.size >= 100) {
+                showErrorToast('В корзине уже 100 предметов.');
+                return;
+            }
+            cartItems.add(sellItemId);
+            button.innerText = 'В КОРЗИНЕ';
+        }
+
+        setAvanCartItems([...cartItems]);
+    }
+
+    function createAvanMarketCard(item) {
+        const sellItem = getAvanBestSellItem(item);
+        if (!sellItem || !item?.full_name) return null;
+
+        const discountPercent = getAvanDiscountPercent(item);
+        const discountText = discountPercent !== null
+            ? `${discountPercent >= 0 ? '-' : '+'}${Math.abs(discountPercent).toFixed(0)}%`
+            : '';
+        const count = Array.isArray(item.sell_items) ? item.sell_items.length : 1;
+        const itemUrl = getAvanItemUrl(item);
+        const isInCart = getAvanCartItems().includes(sellItem.id);
+        const card = document.createElement('div');
+        card.className = 'marketProductCard-module__generated__cardHovered loaded-by-script avan-market-card';
+        card.style = `
+            position: relative; min-height: 222px; border-radius: 8px; border: 1px solid rgba(107, 121, 143, .38); background: #1b2028;
+            color: #fff; padding: 12px; box-sizing: border-box; overflow: hidden;
+            font-family: Arial, "Helvetica Neue", sans-serif; cursor: pointer;
+        `;
+        card.setAttribute('data-market-hash-name', item.full_name);
+
+        card.innerHTML = `
+            <a href="${escapeHtml(itemUrl)}" class="avan-card-link" style="position:absolute; inset:0; z-index:1;" aria-label="${escapeHtml(item.full_name)}"></a>
+            <div style="position:relative; z-index:2; display:flex; justify-content:space-between; align-items:center; font-size:12px; margin-bottom:4px; pointer-events:none;">
+                <span style="color:#ffd400; font-weight:bold;">⚡</span>
+                <span>x${count}</span>
+            </div>
+            <div style="position:relative; z-index:2; height:100px; display:flex; align-items:center; justify-content:center; margin:2px 0 8px; pointer-events:none;">
+                <img alt="${escapeHtml(item.full_name)}" src="${STEAM_IMAGE_BASE_URL}${item.icon_url || ''}" style="max-width:100%; max-height:100%; object-fit:contain;">
+            </div>
+            <div style="position:relative; z-index:2; display:flex; align-items:center; gap:6px; margin-bottom:6px; pointer-events:none;">
+                <div class="marketGunCardPrice" style="font-weight:bold; font-size:17px; letter-spacing:.2px;">
+                    <span>${formatAvanPrice(sellItem.sell_price)}</span>
+                </div>
+                ${discountText ? `<span style="background:#14532d; color:#4ade80; border-radius:4px; padding:2px 5px; font-size:11px; font-weight:bold;">${discountText}</span>` : ''}
+            </div>
+            <div style="position:relative; z-index:2; color:#8b96a8; font-size:12px; margin-bottom:2px; pointer-events:none;">${escapeHtml(item.type_ru || item.type || '')}</div>
+            <div style="position:relative; z-index:2; font-size:14px; line-height:1.2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; pointer-events:none;">${escapeHtml(item.name || item.full_name)}</div>
+            <div class="avan-card-button-wrap">
+                <button type="button" class="avan-card-cart-button">${isInCart ? 'В КОРЗИНЕ' : 'В КОРЗИНУ'}</button>
+            </div>
+        `;
+        card.querySelector('.avan-card-cart-button')?.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggleAvanCartItem(sellItem.id, event.currentTarget);
+        });
+
+        return card;
+    }
+
+    function buildAvanCatalogUrl(pageNumber) {
+        const params = new URLSearchParams(window.location.search);
+        params.set('app_id', getCurrentAppId());
+        params.set('currency', getAvanCurrencyId());
+        params.set('page', pageNumber);
+        params.delete('game');
+
+        return `${AVAN_API_URL}?${params.toString()}`;
+    }
+
+    async function loadAvanMarketPage(pageNumber, signal) {
+        const response = await fetch(buildAvanCatalogUrl(pageNumber), {
+            signal,
+            credentials: 'include',
+            headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json'
+            }
+        });
+
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const data = await response.json();
+        const cards = Array.isArray(data?.data)
+            ? data.data.map(createAvanMarketCard).filter(Boolean)
+            : [];
+
+        return { page: pageNumber, cards };
     }
 
     function findCsExteriorText(totalCard) {
@@ -1129,7 +1381,7 @@
                         setCardPriceError(
                             task.targetLinkElement,
                             task.totalCard,
-                            !isValidPrice(lisPrice) ? 'Ошибка цены LIS' : 'Ошибка цены Steam'
+                            !isValidPrice(lisPrice) ? 'Ошибка цены сайта' : 'Ошибка цены Steam'
                         );
                         completeSteamTask(operation);
                         continue;
@@ -1272,7 +1524,7 @@
     }
 
     function shouldInjectPanel() {
-        return Boolean(document.querySelector('.skins-market-skins-list > .item'));
+        return getMarketCards().length > 0;
     }
 
     function injectPanel() {
@@ -1396,6 +1648,15 @@
                 align-items: stretch;
                 gap: 3px;
             }
+            .lis-number-control input[type="number"] {
+                appearance: textfield;
+                -moz-appearance: textfield;
+            }
+            .lis-number-control input[type="number"]::-webkit-outer-spin-button,
+            .lis-number-control input[type="number"]::-webkit-inner-spin-button {
+                -webkit-appearance: none;
+                margin: 0;
+            }
             .lis-setting-row {
                 display: grid;
                 grid-template-columns: minmax(0, 1fr) auto auto;
@@ -1514,6 +1775,59 @@
                 background: ${PROFIT_COLOR_NEGATIVE};
                 color: ${COLOR_TEXT};
             }
+            .avan-market-card .avan-card-button-wrap {
+                position: absolute;
+                left: -1px;
+                right: -1px;
+                bottom: -40px;
+                z-index: 20;
+                opacity: 0;
+                pointer-events: none;
+                border-radius: 0 0 8px 8px;
+                height: 40px;
+                margin: 0;
+                transition: opacity, transform;
+                transform: translateY(-20px);
+            }
+            .avan-market-card {
+                will-change: transform;
+                transition: all .3s ease-in-out;
+                transform-origin: center;
+            }
+            .avan-market-card:hover {
+                z-index: 22;
+                overflow: visible !important;
+                transition: all .3s ease-out;
+                transform: translateY(-14px) scale(1.07);
+                box-shadow: 0 12px 24px rgba(0, 0, 0, .42);
+            }
+            .avan-market-card:hover .avan-card-button-wrap {
+                opacity: 1;
+                pointer-events: auto;
+                z-index: 10;
+                margin: 0;
+                transition: opacity .3s ease-out, transform .3s ease-out;
+                transform: translateY(-1px);
+            }
+            .avan-market-card .avan-card-cart-button {
+                width: 100%;
+                border: none;
+                border-radius: 0 0 8px 8px;
+                background: #fbd506;
+                color: #0f172a;
+                height: 40px;
+                padding: 8px;
+                font-family: Inter Tight, Arial, "Helvetica Neue", sans-serif;
+                font-size: 14px;
+                font-weight: 600;
+                line-height: 24px;
+                letter-spacing: .02em;
+                text-transform: uppercase;
+                cursor: pointer;
+            }
+            .avan-market-card .avan-card-cart-button:hover {
+                background: #ffe81d;
+            }
             `;
             document.head.appendChild(style);
         }
@@ -1556,14 +1870,14 @@
                         <button type="button" class="lis-stepper" data-step-target="diff-num-input" data-step-delta="-1">▼</button>
                     </div>
                 </div>
-                <span class="lis-help" data-tooltip="Минимальная скидка на LIS. При 0 показываются все карточки.">?</span>
+                <span class="lis-help" data-tooltip="Минимальная скидка на сайте. При 0 показываются все карточки.">?</span>
             </div>
             <input type="range" id="min-diff-input" min="0" max="80" value="${Math.min(parseInt(savedDiff), 80)}" step="1" style="
                 width: 100%; margin-bottom: 15px; cursor: pointer; accent-color: ${COLOR_PANEL_ACCENT};
             ">
 
             <div class="lis-setting-row">
-                <label>Страниц LIS:</label>
+                <label>Страниц сайта:</label>
                 <div class="lis-number-control">
                     <input type="number" id="pages-num-input" min="1" max="999" value="${Math.min(parseInt(savedPages), 999)}" style="
                         width: 60px; background: ${COLOR_PANEL_FIELD_BG}; color: ${COLOR_PANEL_SECONDARY_ACCENT}; border: 1px solid ${COLOR_PANEL_BORDER};
@@ -1574,14 +1888,14 @@
                         <button type="button" class="lis-stepper" data-step-target="pages-num-input" data-step-delta="-1">▼</button>
                     </div>
                 </div>
-                <span class="lis-help" data-tooltip="Сколько страниц LIS загрузить для поиска.">?</span>
+                <span class="lis-help" data-tooltip="Сколько страниц сайта загрузить для поиска.">?</span>
             </div>
             <input type="range" id="pages-to-load" min="1" max="999" value="${Math.min(parseInt(savedPages), 999)}" style="
                 width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${COLOR_PANEL_SECONDARY_ACCENT};
             ">
 
             <div class="lis-setting-row">
-                <label>Потоков LIS:</label>
+                <label>Потоков сайта:</label>
                 <div class="lis-number-control">
                     <input type="number" id="lis-pages-workers-num-input" min="1" max="33" value="${Math.min(parseInt(savedLisPagesWorkers), 33)}" style="
                         width: 50px; background: ${COLOR_PANEL_FIELD_BG}; color: ${PROFIT_COLOR_NEUTRAL}; border: 1px solid ${COLOR_PANEL_BORDER};
@@ -1592,7 +1906,7 @@
                         <button type="button" class="lis-stepper" data-step-target="lis-pages-workers-num-input" data-step-delta="-1">▼</button>
                     </div>
                 </div>
-                <span class="lis-help" data-tooltip="Сколько страниц LIS загружать одновременно. Высокое значение повышает нагрузку на сайт.">?</span>
+                <span class="lis-help" data-tooltip="Сколько страниц сайта загружать одновременно. Высокое значение повышает нагрузку на сайт.">?</span>
             </div>
             <input type="range" id="lis-pages-workers-to-load" min="1" max="33" value="${Math.min(parseInt(savedLisPagesWorkers), 33)}" style="
                 width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${PROFIT_COLOR_NEUTRAL};
@@ -1826,7 +2140,7 @@
                 setCardPriceError(
                     targetLinkElement,
                     totalCard,
-                    !isValidPrice(lisPrice) ? 'Ошибка цены LIS' : 'Ошибка цены Steam'
+                    !isValidPrice(lisPrice) ? 'Ошибка цены сайта' : 'Ошибка цены Steam'
                 );
                 return false;
             }
@@ -2059,7 +2373,7 @@
         const lisPrice = parseFloat(targetLinkElement.getAttribute('data-lis-price')) || 0;
 
         if (!isValidPrice(steamPrice)) return 'Ошибка цены Steam';
-        if (!isValidPrice(lisPrice)) return 'Ошибка цены LIS';
+        if (!isValidPrice(lisPrice)) return 'Ошибка цены сайта';
 
         const ordersText = ordersCount ? ` [${ordersCount} шт.]` : '';
         let resultText = `${formatCurrency(steamPrice)}${ordersText}`;
@@ -2431,7 +2745,7 @@
     }
 
     function getResultStats() {
-        const cards = Array.from(document.querySelectorAll('.skins-market-skins-list > .item')).filter(isVisibleCard);
+        const cards = getMarketCards().filter(isVisibleCard);
         const stats = {
             total: cards.length,
             profitable: 0,
@@ -2508,13 +2822,13 @@
     }
 
     function sortCardsByProfit(updateStatus = true) {
-        const gridContainer = document.querySelector('.skins-market-skins-list');
+        const gridContainer = getMarketGridContainer();
         const statusDiv = document.getElementById('combine-status');
         if (!gridContainer) return;
 
         if (updateStatus && statusDiv && !currentOperation) statusDiv.innerText = "Сортирую по выгоде";
 
-        let cardsArray = Array.from(gridContainer.querySelectorAll('.skins-market-skins-list > .item'));
+        let cardsArray = getMarketCards(gridContainer);
 
         cardsArray = cardsArray.filter(card => {
             return !removeCardBelowProfitThreshold(card);
@@ -2540,27 +2854,19 @@
 
         const startSteamQueue = options.startSteamQueue !== false;
         const minVal = parseFloat(document.getElementById('diff-num-input').value) || 0;
-        const allCards = Array.from(document.querySelectorAll('.skins-market-skins-list > .item'))
+        const allCards = getMarketCards()
             .filter(card => !card.hasAttribute('data-lis-helper-filtered')
                 && !card.querySelector('.steam-highest-buy-order-link[data-lis-helper-badge="true"]'));
 
-        let currentAppId = 252490; // По умолчанию Rust
-        const currentUrl = window.location.href;
-        if (currentUrl.includes('/cs2/') || currentUrl.includes('/csgo/')) currentAppId = 730;
-        else if (currentUrl.includes('/dota2/')) currentAppId = 570;
+        const currentAppId = getCurrentAppId();
 
         steamRequestsQueue = [];
 
         allCards.forEach(totalCard => {
             totalCard.style.position = 'relative';
-            const elem = totalCard.querySelector('.steam-price-discount');
-            let passesDiffFilter = minVal <= 0;
-
-            if (elem && elem.hasAttribute('data-diff-value')) {
-                const rawAttr = elem.getAttribute('data-diff-value') || '';
-                const attrValue = parseFloat(rawAttr.replace('%', ''));
-                passesDiffFilter = passesDiffFilter || (!isNaN(attrValue) && attrValue >= minVal);
-            }
+            const cardDiffPercent = getCardDiffPercent(totalCard);
+            const passesDiffFilter = minVal <= 0
+                || cardDiffPercent >= minVal;
 
             if (passesDiffFilter) {
                 totalCard.style.display = '';
@@ -2585,12 +2891,12 @@
                         steamLink.innerText = 'Загружаю';
                         attachProfitTooltip(steamLink);
 
-                        const lisPriceElem = totalCard.querySelector('.price');
-                        const lisPrice = lisPriceElem ? parseFloat(lisPriceElem.innerText.replace(/[^0-9.,]/g, '').replace(',', '.')) : 0;
+                        const lisPriceElem = getCardPriceElement(totalCard);
+                        const lisPrice = lisPriceElem ? parseMarketPrice(lisPriceElem.innerText) : 0;
                         steamLink.setAttribute('data-lis-price', lisPrice);
 
                         if (!isValidPrice(lisPrice)) {
-                            setCardPriceError(steamLink, totalCard, 'Ошибка цены LIS');
+                            setCardPriceError(steamLink, totalCard, 'Ошибка цены сайта');
                             totalCard.appendChild(steamLink);
                             return;
                         }
@@ -2689,7 +2995,7 @@
             startedAt: Date.now()
         };
 
-        const gridContainer = document.querySelector('.skins-market-skins-list');
+        const gridContainer = getMarketGridContainer();
         if (!gridContainer) {
             finishOperation(operation, "Не найдена сетка карточек");
             return;
@@ -2705,7 +3011,7 @@
         const baseUrl = window.location.origin + window.location.pathname;
         const searchParams = new URLSearchParams(window.location.search);
         const lisPagesConcurrency = getLisPagesConcurrency();
-        let cardsPendingSteamProcess = gridContainer.querySelectorAll('.skins-market-skins-list > .item').length;
+        let cardsPendingSteamProcess = getMarketCards(gridContainer).length;
         operation.lisProgress = {
             total: pagesCount - 1,
             completed: 0,
@@ -2735,6 +3041,13 @@
                     };
                     operation.cleanups.add(cleanup);
 
+                    if (isAvanMarketPage()) {
+                        const result = await loadAvanMarketPage(pageNumber, controller.signal);
+                        clearTimeout(timeoutId);
+                        operation.cleanups.delete(cleanup);
+                        return result;
+                    }
+
                     const response = await fetch(targetUrl, { signal: controller.signal });
                     if (!isOperationActive(operation)) return { page: pageNumber, cancelled: true };
 
@@ -2746,7 +3059,7 @@
 
                     const parser = new DOMParser();
                     const doc = parser.parseFromString(htmlText, 'text/html');
-                    const remoteCards = doc.querySelectorAll('.skins-market-skins-list > .item');
+                    const remoteCards = getMarketCards(doc);
 
                     const cards = Array.from(remoteCards).map(card => {
                         const clonedCard = card.cloneNode(true);
@@ -2804,9 +3117,9 @@
 
             if (result.error) {
                 if (result.timedOut) {
-                    showErrorToast(`Страница ${result.page} LIS не ответила после ${LIS_PAGE_MAX_RETRIES + 1} попыток.`);
+                    showErrorToast(`Страница ${result.page} сайта не ответила после ${LIS_PAGE_MAX_RETRIES + 1} попыток.`);
                 } else {
-                    showErrorToast(`Не удалось загрузить страницу ${result.page} LIS после ${LIS_PAGE_MAX_RETRIES + 1} попыток.`);
+                    showErrorToast(`Не удалось загрузить страницу ${result.page} сайта после ${LIS_PAGE_MAX_RETRIES + 1} попыток.`);
                 }
                 if (options.queueFailedPages) failedLisPagesQueue.push(result.page);
                 updateLisProgress(operation);
