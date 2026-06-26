@@ -244,6 +244,7 @@
             card.removeAttribute('data-calculated-profit');
             card.removeAttribute('data-calculated-profit-percent');
             card.removeAttribute('data-lis-helper-filtered');
+            card.removeAttribute('data-lis-helper-steam-state');
             card.style.display = '';
         });
     }
@@ -293,7 +294,8 @@
         updateOperationStatus(operation);
     }
 
-    function completeSteamTask(operation) {
+    function completeSteamTask(operation, task = null) {
+        if (task?.totalCard) task.totalCard.setAttribute('data-lis-helper-steam-state', 'done');
         operation.steamProgress.completed++;
 
         if (operation.steamProgress.completed % operation.steamProgress.sortEvery === 0) {
@@ -1369,7 +1371,7 @@
                 if (cached) {
                     if (cached.status === 'no-orders') {
                         setCardNoBuyOrders(task.targetLinkElement, task.totalCard);
-                        completeSteamTask(operation);
+                        completeSteamTask(operation, task);
                         continue;
                     }
 
@@ -1383,7 +1385,7 @@
                             task.totalCard,
                             !isValidPrice(lisPrice) ? 'Ошибка цены сайта' : 'Ошибка цены Steam'
                         );
-                        completeSteamTask(operation);
+                        completeSteamTask(operation, task);
                         continue;
                     }
 
@@ -1395,7 +1397,7 @@
                     setSteamBreakdown(task.targetLinkElement, breakdownRows);
                     applyProfitBadgeColor(task.targetLinkElement, calculatedProfit, getProfitPercentFromCard(task.totalCard));
                     removeCardBelowProfitThreshold(task.totalCard);
-                    completeSteamTask(operation);
+                    completeSteamTask(operation, task);
 
                     continue;
                 }
@@ -1429,7 +1431,7 @@
                                 task.targetLinkElement.style.setProperty('background', PROFIT_COLOR_NEGATIVE, 'important');
                                 task.totalCard.setAttribute('data-calculated-profit', -999999);
                                 task.totalCard.removeAttribute('data-calculated-profit-percent');
-                                completeSteamTask(operation);
+                                completeSteamTask(operation, task);
                             }
                             resolve();
                         } else {
@@ -1438,7 +1440,7 @@
                             }
                             const delay = 1200 + Math.random() * 800;
                             await waitForOperation(operation, delay);
-                            completeSteamTask(operation);
+                            completeSteamTask(operation, task);
                             resolve();
                         }
                     };
@@ -2856,6 +2858,7 @@
         const minVal = parseFloat(document.getElementById('diff-num-input').value) || 0;
         const allCards = getMarketCards()
             .filter(card => !card.hasAttribute('data-lis-helper-filtered')
+                && !card.hasAttribute('data-lis-helper-steam-state')
                 && !card.querySelector('.steam-highest-buy-order-link[data-lis-helper-badge="true"]'));
 
         const currentAppId = getCurrentAppId();
@@ -2897,6 +2900,7 @@
 
                         if (!isValidPrice(lisPrice)) {
                             setCardPriceError(steamLink, totalCard, 'Ошибка цены сайта');
+                            totalCard.setAttribute('data-lis-helper-steam-state', 'done');
                             totalCard.appendChild(steamLink);
                             return;
                         }
@@ -2905,6 +2909,7 @@
                         const targetSteamUrl = buildSteamListingUrl(currentAppId, steamMarketHashName, totalCard);
                         steamLink.setAttribute('href', targetSteamUrl);
                         totalCard.appendChild(steamLink);
+                        totalCard.setAttribute('data-lis-helper-steam-state', 'queued');
 
                         steamRequestsQueue.push({
                             targetUrl: targetSteamUrl,
