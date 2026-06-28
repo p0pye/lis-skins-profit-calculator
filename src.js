@@ -398,6 +398,13 @@
         return value;
     }
 
+    function isSteamHtmlFallbackEnabled() {
+        const input = document.getElementById('steam-html-fallback-input');
+        if (input) return input.checked;
+
+        return localStorage.getItem('lis_helper_steam_html_fallback') !== '0';
+    }
+
     function clampProfitDeleteThreshold(value) {
         let parsed = parseInt(value);
 
@@ -439,7 +446,9 @@
 
         normalized = normalized.replace(/\s+\(Not Painted\)$/i, '');
         normalized = normalized.replace(/^StatTrak™?\s+★\s+/i, '★ StatTrak™ ');
+        normalized = normalized.replace(/^★\s+StatTrak™?\s+StatTrak™?\s+/i, '★ StatTrak™ ');
         normalized = normalized.replace(/^Souvenir\s+★\s+/i, '★ Souvenir ');
+        normalized = normalized.replace(/^★\s+Souvenir\s+Souvenir\s+/i, '★ Souvenir ');
         normalized = normalized.replace(/^Souvenir\s+(.+\s+Souvenir\s+(?:Highlight\s+)?Package)$/i, '$1');
 
         normalized = normalized.replace(
@@ -535,70 +544,24 @@
         return cached;
     }
 
-    function isAvanMarketPage() {
-        return window.location.hostname === 'avan.market';
-    }
-
-    function getMarketGridContainer(root = document) {
-        return root.querySelector('.skins-market-skins-list')
-            || root.querySelector('[class*="marketArticlesContainer"]');
-    }
-
-    function getMarketCards(root = document) {
-        if (root?.matches?.('.skins-market-skins-list, [class*="marketArticlesContainer"]')) {
-            return Array.from(root.querySelectorAll(':scope > .item, :scope > [class*="cardHovered"]'));
-        }
-
-        return Array.from(root.querySelectorAll(MARKET_CARD_SELECTOR));
-    }
-
-    function isAvanMarketCard(card) {
-        return Boolean(card?.matches?.(AVAN_CARD_SELECTOR) || card?.className?.includes?.('cardHovered'));
-    }
-
-    function getCardPriceElement(card) {
-        return card.querySelector('.price')
-            || card.querySelector('[class*="marketGunCardPrice"] span')
-            || card.querySelector('[class*="marketGunCardPrice"]');
-    }
-
     function parseMarketPrice(text) {
         return parseFloat(String(text || '').replace(/[^0-9.,]/g, '').replace(',', '.'));
     }
 
-    function getCardDiffPercent(card) {
-        const elem = card.querySelector('.steam-price-discount');
-        if (!elem && !isAvanMarketCard(card)) return null;
-
-        if (elem) {
-            const rawValue = elem.getAttribute('data-diff-value') || elem.textContent || '';
-            const attrValue = parseFloat(rawValue.replace('%', '').replace(',', '.'));
-            return Number.isFinite(attrValue) ? attrValue : null;
-        }
-
-        const cardText = normalizeItemName(
-            Array.from(card.querySelectorAll('*'))
-                .filter(element => !element.closest('.steam-highest-buy-order-link[data-lis-helper-badge="true"]'))
-                .map(element => element.childNodes.length === 1 ? element.textContent : '')
-                .join(' ')
-        );
-        const discountMatches = Array.from(cardText.matchAll(/-([0-9]+(?:[.,][0-9]+)?)\s*%/g));
-        const discountValues = discountMatches
-            .map(match => parseFloat(match[1].replace(',', '.')))
-            .filter(Number.isFinite);
-
-        return discountValues.length > 0 ? Math.max(...discountValues) : null;
-    }
-
-    function getCurrentAppId() {
+    function detectAppId(defaultAppId = 252490) {
         const currentUrl = window.location.href;
         const currentPath = window.location.pathname;
-        const gameParam = new URLSearchParams(window.location.search).get('game') || '';
+        const searchParams = new URLSearchParams(window.location.search);
+        const appIdParam = parseInt(searchParams.get('app_id'), 10);
+        const gameParam = (searchParams.get('game') || '').toLowerCase();
+
+        if (Number.isFinite(appIdParam) && appIdParam > 0) return appIdParam;
         if (currentUrl.includes('/dota2/') || currentPath.includes('/market/dota2') || gameParam === 'dota2') return 570;
         if (currentUrl.includes('/rust/') || currentPath.includes('/market/rust') || gameParam === 'rust') return 252490;
         if (currentUrl.includes('/cs2/') || currentUrl.includes('/csgo/') || currentPath.includes('/market/cs') || gameParam === 'cs') return 730;
+        if (currentUrl.includes('/tf2/') || currentPath.includes('/market/tf2') || gameParam === 'tf2') return 440;
 
-        return isAvanMarketPage() ? 730 : 252490;
+        return defaultAppId;
     }
 
     function getAvanCurrencyId() {
@@ -645,6 +608,7 @@
     function getAvanGameSlug(appId = getCurrentAppId()) {
         if (Number(appId) === 570) return 'dota2';
         if (Number(appId) === 252490) return 'rust';
+        if (Number(appId) === 440) return 'tf2';
 
         return 'cs';
     }
@@ -780,6 +744,155 @@
         return { page: pageNumber, cards };
     }
 
+    const lisMarketAdapter = {
+        id: 'lis',
+        cardSelector: LIS_CARD_SELECTOR,
+        gridSelector: '.skins-market-skins-list',
+        matchesLocation: () => window.location.hostname === 'lis-skins.com',
+        getGridContainer(root = document) {
+            return root.querySelector(this.gridSelector);
+        },
+        getCards(root = document) {
+            if (root?.matches?.(this.gridSelector)) {
+                return Array.from(root.querySelectorAll(':scope > .item'));
+            }
+
+            return Array.from(root.querySelectorAll(this.cardSelector));
+        },
+        isCard(card) {
+            return Boolean(card?.matches?.(this.cardSelector));
+        },
+        getPriceElement(card) {
+            return card.querySelector('.price');
+        },
+        parsePrice(text) {
+            return parseMarketPrice(text);
+        },
+        getDiffPercent(card) {
+            const elem = card.querySelector('.steam-price-discount');
+            if (!elem) return null;
+
+            const rawValue = elem.getAttribute('data-diff-value') || elem.textContent || '';
+            const attrValue = parseFloat(rawValue.replace('%', '').replace(',', '.'));
+            return Number.isFinite(attrValue) ? attrValue : null;
+        },
+        getAppId() {
+            return detectAppId(252490);
+        },
+        async loadPage(pageNumber, { signal, baseUrl, searchParams }) {
+            const pageSearchParams = new URLSearchParams(searchParams);
+            pageSearchParams.set('page', pageNumber);
+            const targetUrl = `${baseUrl}?${pageSearchParams.toString()}`;
+            const response = await fetch(targetUrl, { signal });
+
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+            const htmlText = await response.text();
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(htmlText, 'text/html');
+            const remoteCards = this.getCards(doc);
+            const cards = Array.from(remoteCards).map(card => {
+                const clonedCard = card.cloneNode(true);
+                clonedCard.classList.add('loaded-by-script');
+                return clonedCard;
+            });
+            if (doc.documentElement) doc.documentElement.textContent = '';
+
+            return { page: pageNumber, cards };
+        }
+    };
+
+    const avanMarketAdapter = {
+        id: 'avan',
+        cardSelector: AVAN_CARD_SELECTOR,
+        gridSelector: '[class*="marketArticlesContainer"]',
+        matchesLocation: () => window.location.hostname === 'avan.market',
+        getGridContainer(root = document) {
+            return root.querySelector(this.gridSelector);
+        },
+        getCards(root = document) {
+            if (root?.matches?.(this.gridSelector)) {
+                return Array.from(root.querySelectorAll(':scope > [class*="cardHovered"]'));
+            }
+
+            return Array.from(root.querySelectorAll(this.cardSelector));
+        },
+        isCard(card) {
+            return Boolean(card?.matches?.(this.cardSelector) || card?.className?.includes?.('cardHovered'));
+        },
+        getPriceElement(card) {
+            return card.querySelector('[class*="marketGunCardPrice"] span')
+                || card.querySelector('[class*="marketGunCardPrice"]');
+        },
+        parsePrice(text) {
+            return parseMarketPrice(text);
+        },
+        getDiffPercent(card) {
+            const cardText = normalizeItemName(
+                Array.from(card.querySelectorAll('*'))
+                    .filter(element => !element.closest('.steam-highest-buy-order-link[data-lis-helper-badge="true"]'))
+                    .map(element => element.childNodes.length === 1 ? element.textContent : '')
+                    .join(' ')
+            );
+            const discountMatches = Array.from(cardText.matchAll(/-([0-9]+(?:[.,][0-9]+)?)\s*%/g));
+            const discountValues = discountMatches
+                .map(match => parseFloat(match[1].replace(',', '.')))
+                .filter(Number.isFinite);
+
+            return discountValues.length > 0 ? Math.max(...discountValues) : null;
+        },
+        getAppId() {
+            return detectAppId(730);
+        },
+        loadPage(pageNumber, { signal }) {
+            return loadAvanMarketPage(pageNumber, signal);
+        }
+    };
+
+    const marketAdapters = [avanMarketAdapter, lisMarketAdapter];
+
+    function getCurrentMarketAdapter() {
+        return marketAdapters.find(adapter => adapter.matchesLocation()) || lisMarketAdapter;
+    }
+
+    function isAvanMarketPage() {
+        return getCurrentMarketAdapter().id === 'avan';
+    }
+
+    function getMarketGridContainer(root = document) {
+        const adapter = getCurrentMarketAdapter();
+        return adapter.getGridContainer(root)
+            || marketAdapters.find(candidate => candidate !== adapter)?.getGridContainer(root)
+            || null;
+    }
+
+    function getMarketCards(root = document) {
+        const adapter = getCurrentMarketAdapter();
+        const cards = adapter.getCards(root);
+        if (cards.length > 0) return cards;
+
+        const fallbackAdapter = marketAdapters.find(candidate => candidate !== adapter);
+        return fallbackAdapter ? fallbackAdapter.getCards(root) : [];
+    }
+
+    function isAvanMarketCard(card) {
+        return avanMarketAdapter.isCard(card);
+    }
+
+    function getCardPriceElement(card) {
+        const adapter = isAvanMarketCard(card) ? avanMarketAdapter : lisMarketAdapter;
+        return adapter.getPriceElement(card);
+    }
+
+    function getCardDiffPercent(card) {
+        const adapter = isAvanMarketCard(card) ? avanMarketAdapter : lisMarketAdapter;
+        return adapter.getDiffPercent(card);
+    }
+
+    function getCurrentAppId() {
+        return getCurrentMarketAdapter().getAppId();
+    }
+
     function findCsExteriorText(totalCard) {
         const cardText = normalizeItemName(totalCard.textContent);
         const fullWearMatch = cardText.match(/\b(Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\b/i);
@@ -826,10 +939,12 @@
         if (appId === 730) {
             const cardText = normalizeItemName(totalCard.textContent);
             const exteriorText = findCsExteriorText(totalCard);
+            const hasStatTrakPrefix = /^StatTrak™?\s+/i.test(itemName) || /^★\s+StatTrak™?\s+/i.test(itemName);
+            const hasSouvenirPrefix = /^Souvenir\s+/i.test(itemName) || /^★\s+Souvenir\s+/i.test(itemName);
 
-            if (/(?:^|[\s/|])ST™?(?=$|[\s/|])|StatTrak™?/i.test(cardText) && !/^StatTrak™?\s+/i.test(itemName)) {
+            if (/(?:^|[\s/|])ST™?(?=$|[\s/|])|StatTrak™?/i.test(cardText) && !hasStatTrakPrefix) {
                 itemName = `StatTrak™ ${itemName}`;
-            } else if (/(?:^|[\s/|])Souvenir(?=$|[\s/|])/i.test(cardText) && !/^Souvenir\s+/i.test(itemName)) {
+            } else if (/(?:^|[\s/|])Souvenir(?=$|[\s/|])/i.test(cardText) && !hasSouvenirPrefix) {
                 itemName = `Souvenir ${itemName}`;
             }
 
@@ -1724,6 +1839,60 @@
                 z-index: 10000001;
                 pointer-events: none;
             }
+            .lis-checkbox-row {
+                display: grid;
+                grid-template-columns: auto minmax(0, 1fr) auto;
+                align-items: center;
+                gap: 7px;
+                margin: -8px 0 16px;
+            }
+            .lis-checkbox-row input[type="checkbox"] {
+                width: 15px;
+                height: 15px;
+                margin: 0;
+                cursor: pointer;
+                accent-color: ${COLOR_PANEL_SUCCESS_ACCENT};
+            }
+            .lis-checkbox-row label {
+                line-height: 1.2;
+                cursor: pointer;
+            }
+            .lis-advanced {
+                margin: -8px 0 16px;
+                border-top: 1px solid ${COLOR_PANEL_BORDER};
+                border-bottom: 1px solid ${COLOR_PANEL_BORDER};
+                padding: 6px 0;
+            }
+            .lis-advanced-toggle {
+                width: 100%;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                padding: 4px 0;
+                border: 0;
+                background: transparent;
+                color: ${COLOR_PANEL_STATUS};
+                font-family: Arial, "Helvetica Neue", sans-serif;
+                font-size: 12px;
+                font-weight: bold;
+                cursor: pointer;
+            }
+            .lis-advanced-toggle:hover {
+                color: ${COLOR_TEXT};
+            }
+            .lis-advanced-chevron {
+                line-height: 1;
+            }
+            .lis-advanced-content {
+                padding-top: 8px;
+            }
+            .lis-advanced[data-open="false"] .lis-advanced-content {
+                display: none;
+            }
+            .lis-advanced .lis-checkbox-row {
+                margin: 0;
+            }
             .lis-profit-tooltip {
                 position: fixed;
                 z-index: 10000000;
@@ -1840,6 +2009,8 @@
         const savedWorkers = localStorage.getItem('lis_helper_workers_count') || '3';
         const savedTooltipRows = localStorage.getItem('lis_helper_tooltip_rows_count') || '3';
         const savedProfitDeleteThreshold = clampProfitDeleteThreshold(localStorage.getItem('lis_helper_profit_delete_threshold'));
+        const savedSteamHtmlFallback = localStorage.getItem('lis_helper_steam_html_fallback') !== '0';
+        const savedAdvancedOpen = localStorage.getItem('lis_helper_advanced_open') === '1';
 
         const panel = document.createElement('div');
         panel.id = 'lis-helper-panel';
@@ -1968,6 +2139,20 @@
                 width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${COLOR_PANEL_ACCENT};
             ">
 
+            <div class="lis-advanced" id="lis-advanced-settings" data-open="${savedAdvancedOpen ? 'true' : 'false'}">
+                <button type="button" id="lis-advanced-toggle" class="lis-advanced-toggle" aria-expanded="${savedAdvancedOpen ? 'true' : 'false'}">
+                    <span>Дополнительно</span>
+                    <span class="lis-advanced-chevron">${savedAdvancedOpen ? '▲' : '▼'}</span>
+                </button>
+                <div class="lis-advanced-content">
+                    <div class="lis-checkbox-row">
+                        <input type="checkbox" id="steam-html-fallback-input" ${savedSteamHtmlFallback ? 'checked' : ''}>
+                        <label for="steam-html-fallback-input">DOM fallback Steam</label>
+                        <span class="lis-help" data-tooltip="Если ручки Steam не вернули данные, пробовать парсить HTML страницы Steam.">?</span>
+                    </div>
+                </div>
+            </div>
+
             <button id="start-combine" style="width: 100%; background: ${PROFIT_COLOR_EXCELLENT}; color: ${COLOR_TEXT}; border: none; padding: 8px; border-radius: 4px; cursor: pointer; font-weight: bold;">Найти выгодные</button>
             <div id="combine-status" style="margin-top: 8px; color: ${COLOR_PANEL_STATUS}; font-size: 11px; text-align: center;"></div>
             </div>
@@ -1989,6 +2174,9 @@
             const profitDeleteThresholdNumber = document.getElementById('profit-delete-threshold-num-input');
             const tooltipRowsSlider = document.getElementById('tooltip-rows-to-load');
             const tooltipRowsNumber = document.getElementById('tooltip-rows-num-input');
+            const steamHtmlFallbackCheckbox = document.getElementById('steam-html-fallback-input');
+            const advancedSettings = document.getElementById('lis-advanced-settings');
+            const advancedToggle = document.getElementById('lis-advanced-toggle');
             const panelToggle = document.getElementById('lis-panel-toggle');
 
             const setPanelCollapsed = (collapsed) => {
@@ -2091,6 +2279,16 @@
                 this.value = val;
                 workersSlider.value = val;
                 localStorage.setItem('lis_helper_workers_count', val);
+            });
+            steamHtmlFallbackCheckbox.addEventListener('change', function() {
+                localStorage.setItem('lis_helper_steam_html_fallback', this.checked ? '1' : '0');
+            });
+            advancedToggle.addEventListener('click', function() {
+                const isOpen = advancedSettings.getAttribute('data-open') !== 'true';
+                advancedSettings.setAttribute('data-open', String(isOpen));
+                advancedToggle.setAttribute('aria-expanded', String(isOpen));
+                advancedToggle.querySelector('.lis-advanced-chevron').innerText = isOpen ? '▲' : '▼';
+                localStorage.setItem('lis_helper_advanced_open', isOpen ? '1' : '0');
             });
             profitDeleteThresholdSlider.addEventListener('input', function() {
                 profitDeleteThresholdNumber.value = this.value;
@@ -2356,8 +2554,14 @@
                 return;
             }
 
-            console.error(`[Profit Calculator Debug] Orderbook failed for "${marketHashName}". Status: ${status}. Falling back to HTML parser.`);
-            fetchHtmlFallback();
+            if (isSteamHtmlFallbackEnabled()) {
+                console.error(`[Profit Calculator Debug] Orderbook failed for "${marketHashName}". Status: ${status}. Falling back to HTML parser.`);
+                fetchHtmlFallback();
+                return;
+            }
+
+            console.error(`[Profit Calculator Debug] Orderbook failed for "${marketHashName}". Status: ${status}. HTML fallback is disabled, trying render endpoint.`);
+            fetchRenderOrFallback();
         });
 
         return {
@@ -2894,8 +3098,9 @@
                         steamLink.innerText = 'Загружаю';
                         attachProfitTooltip(steamLink);
 
-                        const lisPriceElem = getCardPriceElement(totalCard);
-                        const lisPrice = lisPriceElem ? parseMarketPrice(lisPriceElem.innerText) : 0;
+                        const marketAdapter = isAvanMarketCard(totalCard) ? avanMarketAdapter : lisMarketAdapter;
+                        const lisPriceElem = marketAdapter.getPriceElement(totalCard);
+                        const lisPrice = lisPriceElem ? marketAdapter.parsePrice(lisPriceElem.innerText) : 0;
                         steamLink.setAttribute('data-lis-price', lisPrice);
 
                         if (!isValidPrice(lisPrice)) {
@@ -3013,8 +3218,11 @@
             return;
         }
 
-        const baseUrl = window.location.origin + window.location.pathname;
-        const searchParams = new URLSearchParams(window.location.search);
+        const marketAdapter = getCurrentMarketAdapter();
+        const pageLoadContext = {
+            baseUrl: window.location.origin + window.location.pathname,
+            searchParams: new URLSearchParams(window.location.search)
+        };
         const lisPagesConcurrency = getLisPagesConcurrency();
         let cardsPendingSteamProcess = getMarketCards(gridContainer).length;
         operation.lisProgress = {
@@ -3025,10 +3233,7 @@
             startedAt: Date.now()
         };
 
-        const loadLisPage = async (pageNumber) => {
-            const pageSearchParams = new URLSearchParams(searchParams);
-            pageSearchParams.set('page', pageNumber);
-            const targetUrl = `${baseUrl}?${pageSearchParams.toString()}`;
+        const loadMarketPage = async (pageNumber) => {
             if (!isOperationActive(operation)) return;
 
             for (let attempt = 1; attempt <= LIS_PAGE_MAX_RETRIES + 1; attempt++) {
@@ -3046,34 +3251,15 @@
                     };
                     operation.cleanups.add(cleanup);
 
-                    if (isAvanMarketPage()) {
-                        const result = await loadAvanMarketPage(pageNumber, controller.signal);
-                        clearTimeout(timeoutId);
-                        operation.cleanups.delete(cleanup);
-                        return result;
-                    }
-
-                    const response = await fetch(targetUrl, { signal: controller.signal });
-                    if (!isOperationActive(operation)) return { page: pageNumber, cancelled: true };
-
-                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                    const htmlText = await response.text();
+                    const result = await marketAdapter.loadPage(pageNumber, {
+                        ...pageLoadContext,
+                        signal: controller.signal
+                    });
                     clearTimeout(timeoutId);
                     operation.cleanups.delete(cleanup);
                     if (!isOperationActive(operation)) return { page: pageNumber, cancelled: true };
 
-                    const parser = new DOMParser();
-                    const doc = parser.parseFromString(htmlText, 'text/html');
-                    const remoteCards = getMarketCards(doc);
-
-                    const cards = Array.from(remoteCards).map(card => {
-                        const clonedCard = card.cloneNode(true);
-                        clonedCard.classList.add('loaded-by-script');
-                        return clonedCard;
-                    });
-                    if (doc.documentElement) doc.documentElement.textContent = '';
-
-                    return { page: pageNumber, cards };
+                    return result;
                 } catch (err) {
                     if (cleanup) {
                         cleanup();
@@ -3161,7 +3347,7 @@
                 if (pageNumber > pagesCount || pageNumber >= firstEmptyPageNumber) return;
 
                 updateLisProgress(operation);
-                const result = await loadLisPage(pageNumber);
+                const result = await loadMarketPage(pageNumber);
                 await handleLisPageResult(result, { queueFailedPages: true });
             }
         };
@@ -3187,7 +3373,7 @@
                     if (!pageNumber) return;
 
                     updateLisProgress(operation);
-                    const result = await loadLisPage(pageNumber);
+                    const result = await loadMarketPage(pageNumber);
                     await handleLisPageResult(result, { isRetry: true });
                 }
             };
