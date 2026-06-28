@@ -510,6 +510,16 @@
         return `${appId}:${marketHashName}`;
     }
 
+    function getSteamMarketHashNameFallbacks(appId, marketHashName) {
+        const normalized = normalizeItemName(marketHashName);
+        if (Number(appId) !== 440 || !normalized) return [];
+
+        const qualityPattern = /^(Unusual|Genuine|Strange|Vintage|Haunted|Collector's)\s+/i;
+        if (qualityPattern.test(normalized)) return [];
+
+        return [];
+    }
+
     function pruneSteamCache() {
         const now = Date.now();
         for (const [cacheKey, cached] of steamCache.entries()) {
@@ -911,6 +921,30 @@
         return wearAliases[shortWearMatch[0].replace(/[\s/|]/g, '').toUpperCase()] || '';
     }
 
+    function getTf2QualityPrefixFromCard(totalCard) {
+        const qualityPrefixes = {
+            unusual: 'Unusual',
+            genuine: 'Genuine',
+            strange: 'Strange',
+            vintage: 'Vintage',
+            haunted: 'Haunted'
+        };
+
+        const values = [];
+        ['data-slug', 'data-url', 'href'].forEach(attr => values.push(totalCard.getAttribute(attr) || ''));
+        totalCard.querySelectorAll('[data-slug], [data-url], a[href]').forEach(element => {
+            ['data-slug', 'data-url', 'href'].forEach(attr => values.push(element.getAttribute(attr) || ''));
+        });
+
+        for (const value of values) {
+            const normalizedValue = decodeURIComponent(String(value)).toLowerCase();
+            const slugMatch = normalizedValue.match(/(?:^|\/)(unusual|genuine|strange|vintage|haunted)-/);
+            if (slugMatch) return qualityPrefixes[slugMatch[1]] || '';
+        }
+
+        return '';
+    }
+
     function getMarketHashNameFromCard(totalCard, appId) {
         const rootCandidates = [];
         const nestedCandidates = [];
@@ -950,6 +984,15 @@
 
             if (exteriorText && !wearPattern.test(itemName)) {
                 itemName = `${itemName} (${exteriorText})`;
+            }
+        }
+
+        if (appId === 440) {
+            const qualityPrefix = getTf2QualityPrefixFromCard(totalCard);
+            const hasQualityPrefix = /^(Unusual|Genuine|Strange|Vintage|Haunted)\s+/i.test(itemName);
+
+            if (qualityPrefix && !hasQualityPrefix) {
+                itemName = `${qualityPrefix} ${itemName}`;
             }
         }
 
@@ -1427,6 +1470,11 @@
                 }
 
                 try {
+                    if (/^\s*</.test(response.responseText || '')) {
+                        if (onComplete) onComplete('render-html');
+                        return;
+                    }
+
                     const data = JSON.parse(response.responseText);
                     if (data?.success === false || data?.success === 0) {
                         if (onComplete) onComplete('render-error');
@@ -1507,6 +1555,9 @@
                     const calculatedProfit = calculateNetProfit(steamPrice, lisPrice);
                     const breakdownRows = calculateSteamBreakdownRows(cached.steamOrderRows, lisPrice);
 
+                    if (cached.marketHashName) {
+                        task.targetLinkElement.href = buildSteamListingUrl(task.appId, cached.marketHashName, task.totalCard);
+                    }
                     task.targetLinkElement.innerText = formatPriceWithProfit(cached.priceText, task.targetLinkElement, cached.ordersCount);
                     setCardCalculatedProfit(task.totalCard, calculatedProfit, lisPrice);
                     setSteamBreakdown(task.targetLinkElement, breakdownRows);
@@ -2323,6 +2374,7 @@
         let orderBookRequest = null;
         let histogramRequest = null;
         let renderRequest = null;
+        const orderBookFallbacks = getSteamMarketHashNameFallbacks(appId, marketHashName);
 
         const applySteamBuyOrders = (buyOrders) => {
             const priceText = buyOrders.priceText;
@@ -2378,6 +2430,11 @@
                 if (status === 200 && data?.status === 'price') {
                     const result = applySteamBuyOrders(data.buyOrders);
                     if (onComplete) onComplete(result ? 200 : 'invalid-price', result || undefined);
+                    return;
+                }
+
+                if (status === 'render-html' && itemNameId) {
+                    fetchHistogramOrFallback(itemNameId, fallbackBuyOrders);
                     return;
                 }
 
@@ -2536,6 +2593,46 @@
             });
         };
 
+        const handleOrderBookFailure = (status) => {
+            const fallbackMarketHashName = orderBookFallbacks.shift();
+            if (fallbackMarketHashName) {
+                console.error(`[Profit Calculator Debug] Orderbook failed for "${marketHashName}". Status: ${status}. Trying fallback "${fallbackMarketHashName}".`);
+                orderBookRequest = fetchSteamOrderBook(appId, fallbackMarketHashName, operation, (fallbackStatus, fallbackData) => {
+                    if (fallbackStatus === 429) {
+                        if (onComplete) onComplete(429);
+                        return;
+                    }
+
+                    if (fallbackStatus === 200 && fallbackData?.status === 'price') {
+                        targetLinkElement.href = buildSteamListingUrl(appId, fallbackMarketHashName, totalCard);
+                        const result = applySteamBuyOrders(fallbackData.buyOrders);
+                        if (result) result.marketHashName = fallbackMarketHashName;
+                        if (onComplete) onComplete(result ? 200 : 'invalid-price', result || undefined);
+                        return;
+                    }
+
+                    if (fallbackStatus === 200 && fallbackData?.status === 'no-orders') {
+                        targetLinkElement.href = buildSteamListingUrl(appId, fallbackMarketHashName, totalCard);
+                        setCardNoBuyOrders(targetLinkElement, totalCard);
+                        if (onComplete) onComplete(200, { status: 'no-orders' });
+                        return;
+                    }
+
+                    handleOrderBookFailure(fallbackStatus);
+                });
+                return;
+            }
+
+            if (isSteamHtmlFallbackEnabled()) {
+                console.error(`[Profit Calculator Debug] Orderbook failed for "${marketHashName}". Status: ${status}. Falling back to HTML parser.`);
+                fetchHtmlFallback();
+                return;
+            }
+
+            console.error(`[Profit Calculator Debug] Orderbook failed for "${marketHashName}". Status: ${status}. HTML fallback is disabled, trying render endpoint.`);
+            fetchRenderOrFallback();
+        };
+
         orderBookRequest = fetchSteamOrderBook(appId, marketHashName, operation, (status, data) => {
             if (status === 429) {
                 if (onComplete) onComplete(429);
@@ -2554,14 +2651,7 @@
                 return;
             }
 
-            if (isSteamHtmlFallbackEnabled()) {
-                console.error(`[Profit Calculator Debug] Orderbook failed for "${marketHashName}". Status: ${status}. Falling back to HTML parser.`);
-                fetchHtmlFallback();
-                return;
-            }
-
-            console.error(`[Profit Calculator Debug] Orderbook failed for "${marketHashName}". Status: ${status}. HTML fallback is disabled, trying render endpoint.`);
-            fetchRenderOrFallback();
+            handleOrderBookFailure(status);
         });
 
         return {
@@ -3189,7 +3279,7 @@
 
         setStartButtonLoading(true);
         updateOverallProgress(0);
-        pruneSteamCache();
+        steamCache.clear();
         resetAnalysisResults();
 
         let pagesCount = parseInt(document.getElementById('pages-num-input').value) || 1;
