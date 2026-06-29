@@ -7,6 +7,10 @@
 // @match        https://lis-skins.com/*/market/*
 // @match        https://avan.market/market*
 // @match        https://avan.market/*/market*
+// @match        https://steam-trader.net/*
+// @match        https://www.steam-trader.net/*
+// @match        https://keys-store.com/skins/*
+// @match        https://www.keys-store.com/skins/*
 // @icon         https://www.google.com/s2/favicons?domain=lis-skins.com&sz=64
 // @grant        GM_xmlhttpRequest
 // @connect      steamcommunity.com
@@ -32,6 +36,7 @@
     const STEAM_CACHE_TTL_MS = 5 * 60 * 1000;
     const MAX_STEAM_CACHE_ENTRIES = 3000;
     const MAX_STEAM_TOOLTIP_ROWS = 20;
+    const FAILED_PAGE_RETRY_QUEUE_ROUNDS = 2;
     const LIS_EARLY_STEAM_PROCESS_CARD_THRESHOLD = 1000;
     const EXCELLENT_PROFIT_PERCENT_THRESHOLD = 30;
     const PROFITABLE_PERCENT_THRESHOLD = 20;
@@ -63,7 +68,30 @@
     const CANCEL_BUTTON_TEXT = 'Остановить';
     const LIS_CARD_SELECTOR = '.skins-market-skins-list > .item';
     const AVAN_CARD_SELECTOR = '[class*="marketArticlesContainer"] > [class*="cardHovered"]';
-    const MARKET_CARD_SELECTOR = `${LIS_CARD_SELECTOR}, ${AVAN_CARD_SELECTOR}`;
+    const STEAM_TRADER_CARD_SELECTOR = [
+        '[class*="CgTf6a__card"]:not([class*="purchaseCard"])',
+        '[data-market-hash-name]',
+        '[data-market-name]',
+        '[data-item-name]',
+        '[data-name][class*="card" i]',
+        '[class*="item-card" i]',
+        '[class*="market-card" i]',
+        '[class*="product-card" i]',
+        '[class*="skin-card" i]',
+        '[class*="inventory-card" i]'
+    ].join(', ');
+    const KEYS_STORE_CARD_SELECTOR = [
+        '[data-market-hash-name]',
+        '[data-market-name]',
+        '[data-item-name]',
+        '[data-name][class*="card" i]',
+        'a[href*="/skins/"]',
+        '[class*="item-card" i]',
+        '[class*="market-card" i]',
+        '[class*="product-card" i]',
+        '[class*="skin-card" i]'
+    ].join(', ');
+    const MARKET_CARD_SELECTOR = `${LIS_CARD_SELECTOR}, ${AVAN_CARD_SELECTOR}, ${STEAM_TRADER_CARD_SELECTOR}, ${KEYS_STORE_CARD_SELECTOR}`;
     const AVAN_API_URL = 'https://avan.market/v1/api/users/catalog';
     const STEAM_IMAGE_BASE_URL = 'https://steamcommunity-a.akamaihd.net/economy/image/';
 
@@ -558,6 +586,141 @@
         return parseFloat(String(text || '').replace(/[^0-9.,]/g, '').replace(',', '.'));
     }
 
+    function getTopLevelMatches(root, selector) {
+        const candidates = Array.from(root.querySelectorAll(selector));
+        return candidates.filter(card => !candidates.some(other => other !== card && other.contains(card)));
+    }
+
+    function getFirstMatchingText(root, selectors) {
+        for (const selector of selectors) {
+            const element = root.querySelector(selector);
+            const text = normalizeItemName(element?.getAttribute('data-discount') || element?.textContent || '');
+            if (text) return text;
+        }
+
+        return '';
+    }
+
+    function parseDiscountPercentFromText(text) {
+        const discountMatches = Array.from(String(text || '').matchAll(/-([0-9]+(?:[.,][0-9]+)?)\s*%/g));
+        const discountValues = discountMatches
+            .map(match => parseFloat(match[1].replace(',', '.')))
+            .filter(Number.isFinite);
+
+        return discountValues.length > 0 ? Math.max(...discountValues) : null;
+    }
+
+    function getSteamTraderMarketHashNameFromCard(card) {
+        const href = card.querySelector('a[href]')?.getAttribute('href') || card.getAttribute('href') || '';
+        if (!href) return '';
+
+        let pathname = href;
+        try {
+            pathname = new URL(href, window.location.origin).pathname;
+        } catch (e) {
+            pathname = href.split('?')[0].split('#')[0];
+        }
+
+        const match = pathname.match(/(?:^|\/)(?:cs2|csgo|dota2|tf2)\/(.+)$/i);
+        if (!match) return '';
+
+        try {
+            return normalizeItemName(decodeURIComponent(match[1]));
+        } catch (e) {
+            return normalizeItemName(match[1]);
+        }
+    }
+
+    function getKeysStoreItemLinks(root) {
+        if (!root?.querySelectorAll) return [];
+
+        const links = [];
+        if (root.matches?.('a[href*="/skins/"]')) {
+            links.push(root);
+        }
+
+        links.push(...root.querySelectorAll('a[href*="/skins/"]'));
+
+        return links.filter(link => getKeysStoreMarketHashNameFromHref(link.getAttribute('href')));
+    }
+
+    function getKeysStoreMarketHashNameFromHref(href) {
+        if (!href) return '';
+
+        let pathname = href;
+        try {
+            pathname = new URL(href, window.location.origin).pathname;
+        } catch (e) {
+            pathname = href.split('?')[0].split('#')[0];
+        }
+
+        const match = pathname.match(/(?:^|\/)skins\/([^/?#]+)\/?$/i);
+        if (!match) return '';
+
+        const slug = match[1];
+        if (/^(tf2|dota2|cs2|csgo|rust)$/i.test(slug)) return '';
+
+        try {
+            return normalizeItemName(decodeURIComponent(slug).replace(/[-_]+/g, ' '));
+        } catch (e) {
+            return normalizeItemName(slug.replace(/[-_]+/g, ' '));
+        }
+    }
+
+    function isLikelyKeysStoreItemName(value) {
+        const text = normalizeItemName(value);
+        if (text.length < 2) return false;
+        if (/[₽$€£¥₴₸₹%]|руб\.?|USD|EUR/i.test(text)) return false;
+        if (/^(x\s*)?\d+$/i.test(text)) return false;
+        if (/^(tf2|dota2|skins?|скины|оружие|броня|одежда|разное|в корзину|купить)$/i.test(text)) return false;
+
+        return true;
+    }
+
+    function getKeysStoreMarketHashNameFromCard(card) {
+        const textValues = [];
+        const hrefValues = [];
+        const addTextValue = value => {
+            if (isLikelyKeysStoreItemName(value)) textValues.push(normalizeItemName(value));
+        };
+
+        ['data-market-hash-name', 'data-market-name', 'data-item-name', 'data-name', 'data-title', 'title', 'aria-label'].forEach(attr => addTextValue(card.getAttribute?.(attr) || ''));
+
+        getKeysStoreItemLinks(card).forEach(link => {
+            ['data-market-hash-name', 'data-market-name', 'data-item-name', 'data-name', 'data-title', 'title', 'aria-label'].forEach(attr => addTextValue(link.getAttribute(attr) || ''));
+            link.querySelectorAll('img[alt], img[title], [data-market-hash-name], [data-market-name], [data-item-name], [data-name], [data-title], [title], [aria-label]').forEach(element => {
+                ['data-market-hash-name', 'data-market-name', 'data-item-name', 'data-name', 'data-title', 'title', 'aria-label', 'alt'].forEach(attr => addTextValue(element.getAttribute(attr) || ''));
+            });
+            hrefValues.push(getKeysStoreMarketHashNameFromHref(link.getAttribute('href')));
+        });
+
+        return textValues.sort((a, b) => b.length - a.length)[0]
+            || hrefValues.map(normalizeItemName).find(Boolean)
+            || '';
+    }
+
+    function loadMarketHtmlPage(adapter, pageNumber, { signal, baseUrl, searchParams }) {
+        const pageSearchParams = new URLSearchParams(searchParams);
+        pageSearchParams.set('page', pageNumber);
+        const targetUrl = `${baseUrl}?${pageSearchParams.toString()}`;
+
+        return fetch(targetUrl, { signal }).then(async response => {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+            const htmlText = await response.text();
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(htmlText, 'text/html');
+            const cards = adapter.getCards(doc).map(card => {
+                const clonedCard = card.cloneNode(true);
+                clonedCard.classList.add('loaded-by-script');
+                return clonedCard;
+            });
+            if (doc.documentElement) doc.documentElement.textContent = '';
+
+            return { page: pageNumber, cards };
+        });
+    }
+
     function detectAppId(defaultAppId = 252490) {
         const currentUrl = window.location.href;
         const currentPath = window.location.pathname;
@@ -566,10 +729,10 @@
         const gameParam = (searchParams.get('game') || '').toLowerCase();
 
         if (Number.isFinite(appIdParam) && appIdParam > 0) return appIdParam;
-        if (currentUrl.includes('/dota2/') || currentPath.includes('/market/dota2') || gameParam === 'dota2') return 570;
+        if (currentUrl.includes('/dota2/') || currentPath.includes('/market/dota2') || currentPath.includes('/dota2') || gameParam === 'dota2') return 570;
         if (currentUrl.includes('/rust/') || currentPath.includes('/market/rust') || gameParam === 'rust') return 252490;
-        if (currentUrl.includes('/cs2/') || currentUrl.includes('/csgo/') || currentPath.includes('/market/cs') || gameParam === 'cs') return 730;
-        if (currentUrl.includes('/tf2/') || currentPath.includes('/market/tf2') || gameParam === 'tf2') return 440;
+        if (currentUrl.includes('/cs2/') || currentUrl.includes('/csgo/') || currentPath.includes('/market/cs') || currentPath.includes('/cs2') || currentPath.includes('/csgo') || gameParam === 'cs' || gameParam === 'cs2' || gameParam === 'csgo') return 730;
+        if (currentUrl.includes('/tf2/') || currentPath.includes('/market/tf2') || currentPath.includes('/tf2') || gameParam === 'tf2') return 440;
 
         return defaultAppId;
     }
@@ -790,25 +953,7 @@
             return detectAppId(252490);
         },
         async loadPage(pageNumber, { signal, baseUrl, searchParams }) {
-            const pageSearchParams = new URLSearchParams(searchParams);
-            pageSearchParams.set('page', pageNumber);
-            const targetUrl = `${baseUrl}?${pageSearchParams.toString()}`;
-            const response = await fetch(targetUrl, { signal });
-
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-            const htmlText = await response.text();
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(htmlText, 'text/html');
-            const remoteCards = this.getCards(doc);
-            const cards = Array.from(remoteCards).map(card => {
-                const clonedCard = card.cloneNode(true);
-                clonedCard.classList.add('loaded-by-script');
-                return clonedCard;
-            });
-            if (doc.documentElement) doc.documentElement.textContent = '';
-
-            return { page: pageNumber, cards };
+            return loadMarketHtmlPage(this, pageNumber, { signal, baseUrl, searchParams });
         }
     };
 
@@ -859,7 +1004,191 @@
         }
     };
 
-    const marketAdapters = [avanMarketAdapter, lisMarketAdapter];
+    const steamTraderMarketAdapter = {
+        id: 'steam-trader',
+        cardSelector: STEAM_TRADER_CARD_SELECTOR,
+        gridSelector: 'section[class*="skinsGrid"], [class*="ddkMKq__skinsGrid"]',
+        matchesLocation: () => ['steam-trader.net', 'www.steam-trader.net'].includes(window.location.hostname),
+        getGridContainer(root = document) {
+            return root.querySelector(this.gridSelector);
+        },
+        getCards(root = document) {
+            const grid = this.getGridContainer(root);
+            const cardRoot = grid || root;
+            const selector = '[class*="CgTf6a__card"]:not([class*="purchaseCard"])';
+            const cards = Array.from(cardRoot.querySelectorAll(grid ? `:scope > ${selector}` : selector))
+                .filter(card => this.getPriceElement(card) && getSteamTraderMarketHashNameFromCard(card));
+
+            if (root === document) return cards;
+
+            return cards.filter(card => card.ownerDocument === root || root.contains(card));
+        },
+        isCard(card) {
+            return Boolean(card?.matches?.('[class*="CgTf6a__card"]:not([class*="purchaseCard"])')
+                || card?.querySelector?.('[class*="CgTf6a__card"]:not([class*="purchaseCard"])'));
+        },
+        getPriceElement(card) {
+            if (isValidPrice(this.parsePrice(card.getAttribute('data-price')))) return card;
+
+            const directSelectors = [
+                '[data-price]',
+                '[class*="iO8oIW__priceBlock"] span',
+                '[class*="priceBlock"] span',
+                '[class*="iO8oIW__priceBlock"]',
+                '[class*="priceBlock"]',
+                '[class*="price" i]',
+                '[class*="cost" i]'
+            ];
+
+            for (const selector of directSelectors) {
+                const element = card.querySelector(selector);
+                const dataPrice = element?.getAttribute('data-price') || '';
+                const text = element?.textContent || '';
+                if (element && isValidPrice(this.parsePrice(dataPrice || text)) && (dataPrice || /[₽$€£¥₴₸₹]|руб\.?|USD|EUR/i.test(text))) {
+                    return element;
+                }
+            }
+
+            const textNodes = Array.from(card.querySelectorAll('*'))
+                .filter(element => !element.closest('.steam-highest-buy-order-link[data-lis-helper-badge="true"]'));
+            return textNodes.find(element => /[₽$€£¥₴₸₹]|руб\.?|USD|EUR/i.test(element.textContent || '')
+                && isValidPrice(this.parsePrice(element.textContent))) || null;
+        },
+        parsePrice(text) {
+            return parseMarketPrice(text);
+        },
+        getDiffPercent(card) {
+            const explicitText = getFirstMatchingText(card, [
+                '[data-discount]',
+                '[class*="Y7m80a__badge"]',
+                '[class*="color-green"]',
+                '[class*="discount" i]',
+                '[class*="sale" i]',
+                '[class*="percent" i]',
+                '[class*="profit" i]'
+            ]);
+            const explicitDiscount = parseDiscountPercentFromText(explicitText);
+            if (explicitDiscount !== null) return explicitDiscount;
+
+            const cardText = normalizeItemName(
+                Array.from(card.querySelectorAll('*'))
+                    .filter(element => !element.closest('.steam-highest-buy-order-link[data-lis-helper-badge="true"]'))
+                    .map(element => element.childNodes.length === 1 ? element.textContent : '')
+                    .join(' ')
+            );
+            return parseDiscountPercentFromText(cardText);
+        },
+        getAppId() {
+            return detectAppId(730);
+        },
+        async loadPage(pageNumber, { signal, baseUrl, searchParams }) {
+            return loadMarketHtmlPage(this, pageNumber, { signal, baseUrl, searchParams });
+        }
+    };
+
+    const keysStoreMarketAdapter = {
+        id: 'keys-store',
+        cardSelector: KEYS_STORE_CARD_SELECTOR,
+        gridSelector: [
+            '[class*="skins" i]',
+            '[class*="catalog" i]',
+            '[class*="products" i]',
+            '[class*="items" i]',
+            '[class*="grid" i]',
+            '[class*="list" i]',
+            'main'
+        ].join(', '),
+        matchesLocation: () => ['keys-store.com', 'www.keys-store.com'].includes(window.location.hostname)
+            && window.location.pathname.includes('/skins/'),
+        getGridContainer(root = document) {
+            const containers = Array.from(root.querySelectorAll(this.gridSelector));
+            return containers.find(container => getKeysStoreItemLinks(container).length >= 2) || null;
+        },
+        getCards(root = document) {
+            const grid = this.getGridContainer(root);
+            const cardRoot = grid || root;
+            const cards = [];
+            const seen = new Set();
+
+            getKeysStoreItemLinks(cardRoot).forEach(link => {
+                let card = null;
+                let current = link;
+                for (let depth = 0; current && current !== cardRoot && depth < 8; depth++, current = current.parentElement) {
+                    if (this.getPriceElement(current) && getKeysStoreMarketHashNameFromCard(current)) {
+                        card = current;
+                        break;
+                    }
+                }
+
+                if (!card || seen.has(card) || !this.getPriceElement(card) || !getKeysStoreMarketHashNameFromCard(card)) return;
+
+                seen.add(card);
+                cards.push(card);
+            });
+
+            if (root === document) return cards;
+
+            return cards.filter(card => card.ownerDocument === root || root.contains(card));
+        },
+        isCard(card) {
+            return Boolean(card && getKeysStoreMarketHashNameFromCard(card) && this.getPriceElement(card));
+        },
+        getPriceElement(card) {
+            if (isValidPrice(this.parsePrice(card.getAttribute?.('data-price')))) return card;
+
+            const directSelectors = [
+                '[data-price]',
+                '[class*="price" i]',
+                '[class*="cost" i]',
+                '[class*="amount" i]',
+                '[class*="value" i]'
+            ];
+
+            for (const selector of directSelectors) {
+                const element = card.querySelector(selector);
+                const dataPrice = element?.getAttribute('data-price') || '';
+                const text = element?.textContent || '';
+                if (element && isValidPrice(this.parsePrice(dataPrice || text)) && (dataPrice || /[₽$€£¥₴₸₹]|руб\.?|USD|EUR/i.test(text))) {
+                    return element;
+                }
+            }
+
+            const textNodes = Array.from(card.querySelectorAll('*'))
+                .filter(element => !element.closest('.steam-highest-buy-order-link[data-lis-helper-badge="true"]'));
+            return textNodes.find(element => /[₽$€£¥₴₸₹]|руб\.?|USD|EUR/i.test(element.textContent || '')
+                && isValidPrice(this.parsePrice(element.textContent))) || null;
+        },
+        parsePrice(text) {
+            return parseMarketPrice(text);
+        },
+        getDiffPercent(card) {
+            const explicitText = getFirstMatchingText(card, [
+                '[data-discount]',
+                '[class*="discount" i]',
+                '[class*="sale" i]',
+                '[class*="percent" i]',
+                '[class*="profit" i]'
+            ]);
+            const explicitDiscount = parseDiscountPercentFromText(explicitText);
+            if (explicitDiscount !== null) return explicitDiscount;
+
+            const cardText = normalizeItemName(
+                Array.from(card.querySelectorAll('*'))
+                    .filter(element => !element.closest('.steam-highest-buy-order-link[data-lis-helper-badge="true"]'))
+                    .map(element => element.childNodes.length === 1 ? element.textContent : '')
+                    .join(' ')
+            );
+            return parseDiscountPercentFromText(cardText);
+        },
+        getAppId() {
+            return detectAppId(440);
+        },
+        async loadPage(pageNumber, { signal, baseUrl, searchParams }) {
+            return loadMarketHtmlPage(this, pageNumber, { signal, baseUrl, searchParams });
+        }
+    };
+
+    const marketAdapters = [keysStoreMarketAdapter, steamTraderMarketAdapter, avanMarketAdapter, lisMarketAdapter];
 
     function getCurrentMarketAdapter() {
         return marketAdapters.find(adapter => adapter.matchesLocation()) || lisMarketAdapter;
@@ -872,7 +1201,7 @@
     function getMarketGridContainer(root = document) {
         const adapter = getCurrentMarketAdapter();
         return adapter.getGridContainer(root)
-            || marketAdapters.find(candidate => candidate !== adapter)?.getGridContainer(root)
+            || marketAdapters.find(candidate => candidate !== adapter && candidate.getGridContainer(root))?.getGridContainer(root)
             || null;
     }
 
@@ -881,8 +1210,17 @@
         const cards = adapter.getCards(root);
         if (cards.length > 0) return cards;
 
-        const fallbackAdapter = marketAdapters.find(candidate => candidate !== adapter);
-        return fallbackAdapter ? fallbackAdapter.getCards(root) : [];
+        for (const fallbackAdapter of marketAdapters) {
+            if (fallbackAdapter === adapter) continue;
+            const fallbackCards = fallbackAdapter.getCards(root);
+            if (fallbackCards.length > 0) return fallbackCards;
+        }
+
+        return [];
+    }
+
+    function getMarketAdapterForCard(card) {
+        return marketAdapters.find(adapter => adapter.isCard(card)) || getCurrentMarketAdapter();
     }
 
     function isAvanMarketCard(card) {
@@ -890,13 +1228,11 @@
     }
 
     function getCardPriceElement(card) {
-        const adapter = isAvanMarketCard(card) ? avanMarketAdapter : lisMarketAdapter;
-        return adapter.getPriceElement(card);
+        return getMarketAdapterForCard(card).getPriceElement(card);
     }
 
     function getCardDiffPercent(card) {
-        const adapter = isAvanMarketCard(card) ? avanMarketAdapter : lisMarketAdapter;
-        return adapter.getDiffPercent(card);
+        return getMarketAdapterForCard(card).getDiffPercent(card);
     }
 
     function getCurrentAppId() {
@@ -946,6 +1282,16 @@
     }
 
     function getMarketHashNameFromCard(totalCard, appId) {
+        if (keysStoreMarketAdapter.isCard(totalCard)) {
+            const keysStoreName = getKeysStoreMarketHashNameFromCard(totalCard);
+            if (keysStoreName) return keysStoreName;
+        }
+
+        if (steamTraderMarketAdapter.isCard(totalCard)) {
+            const steamTraderName = getSteamTraderMarketHashNameFromCard(totalCard);
+            if (steamTraderName) return steamTraderName;
+        }
+
         const rootCandidates = [];
         const nestedCandidates = [];
         const addCandidate = (target, value) => {
@@ -953,13 +1299,13 @@
             if (normalized) target.push(normalized);
         };
 
-        ['data-market-hash-name', 'data-name', 'data-title'].forEach(attr => addCandidate(rootCandidates, totalCard.getAttribute(attr)));
+        ['data-market-hash-name', 'data-market-name', 'data-item-name', 'data-name', 'data-title', 'aria-label'].forEach(attr => addCandidate(rootCandidates, totalCard.getAttribute(attr)));
 
-        totalCard.querySelectorAll('[data-market-hash-name], [data-name], [data-title], img[alt], img[title], a[title]').forEach(element => {
-            ['data-market-hash-name', 'data-name', 'data-title', 'alt', 'title'].forEach(attr => addCandidate(nestedCandidates, element.getAttribute(attr)));
+        totalCard.querySelectorAll('[data-market-hash-name], [data-market-name], [data-item-name], [data-name], [data-title], [aria-label], img[alt], img[title], a[title]').forEach(element => {
+            ['data-market-hash-name', 'data-market-name', 'data-item-name', 'data-name', 'data-title', 'aria-label', 'alt', 'title'].forEach(attr => addCandidate(nestedCandidates, element.getAttribute(attr)));
         });
 
-        const titleElem = totalCard.querySelector('.name, .item-name, .inner-name');
+        const titleElem = totalCard.querySelector('.name, .item-name, .inner-name, [class*="name" i], [class*="title" i]');
         const titleText = normalizeItemName(titleElem ? titleElem.textContent : '');
 
         const wearPattern = /\((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)$/i;
@@ -1747,12 +2093,25 @@
                 align-items: center;
                 justify-content: center;
             }
+            #lis-helper-panel,
+            #lis-helper-panel * {
+                box-sizing: border-box !important;
+            }
+            #lis-helper-panel input,
+            #lis-helper-panel button,
+            #lis-helper-panel label {
+                font-family: Arial, "Helvetica Neue", sans-serif !important;
+            }
+            #lis-helper-panel input {
+                line-height: normal !important;
+            }
             .lis-panel-header {
                 display: flex;
                 align-items: center;
-                justify-content: space-between;
-                gap: 10px;
+                justify-content: center;
                 margin-bottom: 12px;
+                cursor: pointer;
+                user-select: none;
             }
             .lis-panel-title {
                 flex: 1;
@@ -1761,21 +2120,8 @@
                 text-align: center;
                 white-space: nowrap;
             }
-            .lis-panel-toggle {
-                width: 24px;
-                height: 24px;
-                padding: 0;
-                border: 1px solid ${COLOR_PANEL_BORDER};
-                border-radius: 4px;
-                background: ${COLOR_PANEL_FIELD_BG};
+            .lis-panel-header:hover .lis-panel-title {
                 color: ${COLOR_TEXT};
-                cursor: pointer;
-                font-family: Arial, "Helvetica Neue", sans-serif;
-                font-size: 14px;
-                line-height: 22px;
-            }
-            .lis-panel-toggle:hover {
-                background: ${COLOR_PANEL_HOVER};
             }
             #lis-helper-panel[data-collapsed="true"] {
                 left: 0 !important;
@@ -1788,25 +2134,13 @@
                 cursor: pointer !important;
             }
             #lis-helper-panel[data-collapsed="true"] .lis-panel-header {
-                flex-direction: column;
-                justify-content: flex-start;
-                gap: 6px;
                 margin-bottom: 0;
             }
             #lis-helper-panel[data-collapsed="true"] .lis-panel-title {
-                order: 2;
                 writing-mode: vertical-rl;
                 transform: rotate(180deg);
                 text-align: left;
                 line-height: 1;
-            }
-            #lis-helper-panel[data-collapsed="true"] .lis-panel-toggle {
-                order: 1;
-                width: 20px;
-                min-width: 20px;
-                height: 20px;
-                font-size: 12px;
-                line-height: 18px;
             }
             #lis-helper-panel[data-collapsed="true"] .lis-panel-content {
                 display: none !important;
@@ -1817,8 +2151,10 @@
                 gap: 3px;
             }
             .lis-number-control input[type="number"] {
-                appearance: textfield;
-                -moz-appearance: textfield;
+                appearance: textfield !important;
+                -moz-appearance: textfield !important;
+                height: 30px !important;
+                min-height: 0 !important;
             }
             .lis-number-control input[type="number"]::-webkit-outer-spin-button,
             .lis-number-control input[type="number"]::-webkit-inner-spin-button {
@@ -1826,7 +2162,7 @@
                 margin: 0;
             }
             .lis-setting-row {
-                display: grid;
+                display: grid !important;
                 grid-template-columns: minmax(0, 1fr) auto auto;
                 align-items: center;
                 gap: 5px;
@@ -1834,6 +2170,62 @@
             }
             .lis-setting-row label {
                 line-height: 1.2;
+                color: ${COLOR_TEXT} !important;
+                margin: 0 !important;
+                padding: 0 !important;
+            }
+            #lis-helper-panel input[type="range"] {
+                -webkit-appearance: none !important;
+                appearance: none !important;
+                display: block !important;
+                height: 14px !important;
+                min-height: 14px !important;
+                padding: 0 !important;
+                border: 0 !important;
+                background: transparent !important;
+            }
+            #lis-helper-panel input[type="range"]::-webkit-slider-runnable-track {
+                height: 4px !important;
+                border-radius: 999px !important;
+                background: linear-gradient(
+                    to right,
+                    var(--lis-range-color, ${COLOR_PANEL_ACCENT}) 0%,
+                    var(--lis-range-color, ${COLOR_PANEL_ACCENT}) var(--lis-range-fill, 0%),
+                    ${COLOR_PANEL_BORDER} var(--lis-range-fill, 0%),
+                    ${COLOR_PANEL_BORDER} 100%
+                ) !important;
+            }
+            #lis-helper-panel input[type="range"]::-webkit-slider-thumb {
+                -webkit-appearance: none !important;
+                appearance: none !important;
+                width: 16px !important;
+                height: 16px !important;
+                margin-top: -6px !important;
+                border-radius: 50% !important;
+                border: 2px solid ${COLOR_TEXT} !important;
+                background: var(--lis-range-color, ${COLOR_PANEL_ACCENT}) !important;
+                cursor: pointer !important;
+                box-shadow: 0 1px 4px ${COLOR_SHADOW} !important;
+            }
+            #lis-helper-panel input[type="range"]::-moz-range-track {
+                height: 4px !important;
+                border-radius: 999px !important;
+                background: linear-gradient(
+                    to right,
+                    var(--lis-range-color, ${COLOR_PANEL_ACCENT}) 0%,
+                    var(--lis-range-color, ${COLOR_PANEL_ACCENT}) var(--lis-range-fill, 0%),
+                    ${COLOR_PANEL_BORDER} var(--lis-range-fill, 0%),
+                    ${COLOR_PANEL_BORDER} 100%
+                ) !important;
+            }
+            #lis-helper-panel input[type="range"]::-moz-range-thumb {
+                width: 16px !important;
+                height: 16px !important;
+                border-radius: 50% !important;
+                border: 2px solid ${COLOR_TEXT} !important;
+                background: var(--lis-range-color, ${COLOR_PANEL_ACCENT}) !important;
+                cursor: pointer !important;
+                box-shadow: 0 1px 4px ${COLOR_SHADOW} !important;
             }
             .lis-stepper-buttons {
                 display: flex;
@@ -1850,7 +2242,10 @@
                 color: ${COLOR_TEXT};
                 cursor: pointer;
                 font-size: 8px;
-                line-height: 10px;
+                line-height: 1;
+                display: inline-flex !important;
+                align-items: center !important;
+                justify-content: center !important;
             }
             .lis-stepper:hover {
                 background: ${COLOR_PANEL_HOVER};
@@ -1902,11 +2297,35 @@
                 height: 15px;
                 margin: 0;
                 cursor: pointer;
-                accent-color: ${COLOR_PANEL_SUCCESS_ACCENT};
+                appearance: none !important;
+                -webkit-appearance: none !important;
+                border: 1px solid ${COLOR_PANEL_BORDER} !important;
+                border-radius: 4px !important;
+                background: ${COLOR_PANEL_FIELD_BG} !important;
+                display: inline-grid !important;
+                place-content: center !important;
+                flex: 0 0 auto !important;
+            }
+            .lis-checkbox-row input[type="checkbox"]::before {
+                content: "";
+                width: 8px;
+                height: 8px;
+                border-radius: 2px;
+                transform: scale(0);
+                transition: transform 120ms ease;
+                background: ${COLOR_PANEL_SUCCESS_ACCENT};
+            }
+            .lis-checkbox-row input[type="checkbox"]:checked {
+                border-color: ${COLOR_PANEL_SUCCESS_ACCENT} !important;
+                background: rgba(34, 197, 94, .15) !important;
+            }
+            .lis-checkbox-row input[type="checkbox"]:checked::before {
+                transform: scale(1);
             }
             .lis-checkbox-row label {
                 line-height: 1.2;
                 cursor: pointer;
+                color: ${COLOR_TEXT} !important;
             }
             .lis-advanced {
                 margin: -8px 0 16px;
@@ -2076,9 +2495,8 @@
         `;
 
         panel.innerHTML = `
-            <div class="lis-panel-header">
+            <div class="lis-panel-header" title="Свернуть настройки">
                 <div class="lis-panel-title">Profit-Calculator</div>
-                <button type="button" id="lis-panel-toggle" class="lis-panel-toggle" aria-label="Свернуть настройки" title="Свернуть настройки">◀</button>
             </div>
 
             <div class="lis-panel-content">
@@ -2097,7 +2515,7 @@
                 <span class="lis-help" data-tooltip="Минимальная скидка на сайте. При 0 показываются все карточки.">?</span>
             </div>
             <input type="range" id="min-diff-input" min="0" max="80" value="${Math.min(parseInt(savedDiff), 80)}" step="1" style="
-                width: 100%; margin-bottom: 15px; cursor: pointer; accent-color: ${COLOR_PANEL_ACCENT};
+                width: 100%; margin-bottom: 15px; cursor: pointer; accent-color: ${COLOR_PANEL_ACCENT}; --lis-range-color: ${COLOR_PANEL_ACCENT};
             ">
 
             <div class="lis-setting-row">
@@ -2115,7 +2533,7 @@
                 <span class="lis-help" data-tooltip="Сколько страниц сайта загрузить для поиска.">?</span>
             </div>
             <input type="range" id="pages-to-load" min="1" max="999" value="${Math.min(parseInt(savedPages), 999)}" style="
-                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${COLOR_PANEL_SECONDARY_ACCENT};
+                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${COLOR_PANEL_SECONDARY_ACCENT}; --lis-range-color: ${COLOR_PANEL_SECONDARY_ACCENT};
             ">
 
             <div class="lis-setting-row">
@@ -2133,7 +2551,7 @@
                 <span class="lis-help" data-tooltip="Сколько страниц сайта загружать одновременно. Высокое значение повышает нагрузку на сайт.">?</span>
             </div>
             <input type="range" id="lis-pages-workers-to-load" min="1" max="33" value="${Math.min(parseInt(savedLisPagesWorkers), 33)}" style="
-                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${PROFIT_COLOR_NEUTRAL};
+                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${PROFIT_COLOR_NEUTRAL}; --lis-range-color: ${PROFIT_COLOR_NEUTRAL};
             ">
 
             <div class="lis-setting-row">
@@ -2151,7 +2569,7 @@
                 <span class="lis-help" data-tooltip="Сколько запросов к Steam делать одновременно. Высокое значение повышает риск блокировки.">?</span>
             </div>
             <input type="range" id="workers-to-load" min="1" max="33" value="${Math.min(parseInt(savedWorkers), 33)}" style="
-                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${COLOR_PANEL_SUCCESS_ACCENT};
+                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${COLOR_PANEL_SUCCESS_ACCENT}; --lis-range-color: ${COLOR_PANEL_SUCCESS_ACCENT};
             ">
 
             <div class="lis-setting-row">
@@ -2169,7 +2587,7 @@
                 <span class="lis-help" data-tooltip="При сортировке удалять карточки, у которых выгода ниже этого процента.">?</span>
             </div>
             <input type="range" id="profit-delete-threshold-to-load" min="-100" max="30" value="${savedProfitDeleteThreshold}" style="
-                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${PROFIT_COLOR_NEGATIVE};
+                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${PROFIT_COLOR_NEGATIVE}; --lis-range-color: ${PROFIT_COLOR_NEGATIVE};
             ">
 
             <div class="lis-setting-row">
@@ -2187,7 +2605,7 @@
                 <span class="lis-help" data-tooltip="Сколько заявок Steam показывать в таблице при наведении на плашку.">?</span>
             </div>
             <input type="range" id="tooltip-rows-to-load" min="1" max="20" value="${Math.min(parseInt(savedTooltipRows), 20)}" style="
-                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${COLOR_PANEL_ACCENT};
+                width: 100%; margin-bottom: 20px; cursor: pointer; accent-color: ${COLOR_PANEL_ACCENT}; --lis-range-color: ${COLOR_PANEL_ACCENT};
             ">
 
             <div class="lis-advanced" id="lis-advanced-settings" data-open="${savedAdvancedOpen ? 'true' : 'false'}">
@@ -2228,7 +2646,7 @@
             const steamHtmlFallbackCheckbox = document.getElementById('steam-html-fallback-input');
             const advancedSettings = document.getElementById('lis-advanced-settings');
             const advancedToggle = document.getElementById('lis-advanced-toggle');
-            const panelToggle = document.getElementById('lis-panel-toggle');
+            const panelHeader = panel.querySelector('.lis-panel-header');
 
             const setPanelCollapsed = (collapsed) => {
                 panel.setAttribute('data-collapsed', String(collapsed));
@@ -2239,14 +2657,12 @@
                 panel.style.setProperty('padding', collapsed ? '7px 3px' : '12px', 'important');
                 panel.style.setProperty('border-radius', collapsed ? '0 8px 8px 0' : '8px', 'important');
                 panel.style.setProperty('box-sizing', 'border-box', 'important');
-                panelToggle.innerText = collapsed ? '▶' : '◀';
-                panelToggle.setAttribute('aria-label', collapsed ? 'Развернуть настройки' : 'Свернуть настройки');
-                panelToggle.title = collapsed ? 'Развернуть настройки' : 'Свернуть настройки';
+                panelHeader.title = collapsed ? 'Развернуть настройки' : 'Свернуть настройки';
                 localStorage.setItem('lis_helper_panel_collapsed', collapsed ? '1' : '0');
             };
 
             setPanelCollapsed(initiallyCollapsed);
-            panelToggle.addEventListener('click', event => {
+            panelHeader.addEventListener('click', event => {
                 event.stopPropagation();
                 setPanelCollapsed(panel.getAttribute('data-collapsed') !== 'true');
             });
@@ -2281,6 +2697,16 @@
                 });
             });
 
+            function updateRangeFill(rangeInput) {
+                const min = parseFloat(rangeInput.min) || 0;
+                const max = parseFloat(rangeInput.max) || 100;
+                const value = parseFloat(rangeInput.value) || min;
+                const percent = max > min ? ((value - min) / (max - min)) * 100 : 0;
+                rangeInput.style.setProperty('--lis-range-fill', `${Math.max(0, Math.min(100, percent))}%`);
+            }
+
+            [diffSlider, pagesSlider, lisPagesWorkersSlider, workersSlider, profitDeleteThresholdSlider, tooltipRowsSlider].forEach(updateRangeFill);
+
             [diffNumber, diffSlider, pagesNumber, pagesSlider, lisPagesWorkersNumber, lisPagesWorkersSlider, workersNumber, workersSlider, profitDeleteThresholdNumber, profitDeleteThresholdSlider, tooltipRowsNumber, tooltipRowsSlider].forEach(input => {
                 input.addEventListener('wheel', function(event) {
                     event.preventDefault();
@@ -2290,16 +2716,19 @@
 
             pagesSlider.addEventListener('input', function() {
                 pagesNumber.value = this.value;
+                updateRangeFill(this);
                 localStorage.setItem('lis_helper_pages_count', this.value);
             });
             pagesNumber.addEventListener('input', function() {
                 let val = parseInt(this.value) || 1;
                 if (val > 999) val = 999; if (val < 1) val = 1;
                 pagesSlider.value = val;
+                updateRangeFill(pagesSlider);
                 localStorage.setItem('lis_helper_pages_count', val);
             });
             lisPagesWorkersSlider.addEventListener('input', function() {
                 lisPagesWorkersNumber.value = this.value;
+                updateRangeFill(this);
                 localStorage.setItem('lis_helper_pages_workers_count', this.value);
             });
             lisPagesWorkersNumber.addEventListener('input', function() {
@@ -2307,21 +2736,25 @@
                 if (val > 33) val = 33; if (val < 1) val = 1;
                 this.value = val;
                 lisPagesWorkersSlider.value = val;
+                updateRangeFill(lisPagesWorkersSlider);
                 localStorage.setItem('lis_helper_pages_workers_count', val);
             });
 
             diffSlider.addEventListener('input', function() {
                 diffNumber.value = this.value;
+                updateRangeFill(this);
                 localStorage.setItem('lis_helper_min_diff', this.value);
             });
             diffNumber.addEventListener('input', function() {
                 let val = parseInt(this.value) || 0;
                 if (val > 100) val = 100; if (val < 0) val = 0;
                 diffSlider.value = Math.min(val, 80);
+                updateRangeFill(diffSlider);
                 localStorage.setItem('lis_helper_min_diff', val);
             });
             workersSlider.addEventListener('input', function() {
                 workersNumber.value = this.value;
+                updateRangeFill(this);
                 localStorage.setItem('lis_helper_workers_count', this.value);
             });
             workersNumber.addEventListener('input', function() {
@@ -2329,6 +2762,7 @@
                 if (val > 33) val = 33; if (val < 1) val = 1;
                 this.value = val;
                 workersSlider.value = val;
+                updateRangeFill(workersSlider);
                 localStorage.setItem('lis_helper_workers_count', val);
             });
             steamHtmlFallbackCheckbox.addEventListener('change', function() {
@@ -2343,16 +2777,19 @@
             });
             profitDeleteThresholdSlider.addEventListener('input', function() {
                 profitDeleteThresholdNumber.value = this.value;
+                updateRangeFill(this);
                 localStorage.setItem('lis_helper_profit_delete_threshold', this.value);
             });
             profitDeleteThresholdNumber.addEventListener('input', function() {
                 const val = clampProfitDeleteThreshold(this.value);
                 this.value = val;
                 profitDeleteThresholdSlider.value = val;
+                updateRangeFill(profitDeleteThresholdSlider);
                 localStorage.setItem('lis_helper_profit_delete_threshold', val);
             });
             tooltipRowsSlider.addEventListener('input', function() {
                 tooltipRowsNumber.value = this.value;
+                updateRangeFill(this);
                 localStorage.setItem('lis_helper_tooltip_rows_count', this.value);
             });
             tooltipRowsNumber.addEventListener('input', function() {
@@ -2360,6 +2797,7 @@
                 if (val > 20) val = 20; if (val < 1) val = 1;
                 this.value = val;
                 tooltipRowsSlider.value = val;
+                updateRangeFill(tooltipRowsSlider);
                 localStorage.setItem('lis_helper_tooltip_rows_count', val);
             });
 
@@ -3188,9 +3626,9 @@
                         steamLink.innerText = 'Загружаю';
                         attachProfitTooltip(steamLink);
 
-                        const marketAdapter = isAvanMarketCard(totalCard) ? avanMarketAdapter : lisMarketAdapter;
+                        const marketAdapter = getMarketAdapterForCard(totalCard);
                         const lisPriceElem = marketAdapter.getPriceElement(totalCard);
-                        const lisPrice = lisPriceElem ? marketAdapter.parsePrice(lisPriceElem.innerText) : 0;
+                        const lisPrice = lisPriceElem ? marketAdapter.parsePrice(lisPriceElem.getAttribute('data-price') || lisPriceElem.innerText) : 0;
                         steamLink.setAttribute('data-lis-price', lisPrice);
 
                         if (!isValidPrice(lisPrice)) {
@@ -3373,7 +3811,7 @@
 
         let nextPageToLoad = 2;
         let firstEmptyPageNumber = Infinity;
-        const failedLisPagesQueue = [];
+        let failedLisPagesQueue = [];
         let loadedCardsProcessingPromise = null;
         const processLoadedCardsIfNeeded = async () => {
             if (cardsPendingSteamProcess <= LIS_EARLY_STEAM_PROCESS_CARD_THRESHOLD) return;
@@ -3402,7 +3840,9 @@
                 } else {
                     showErrorToast(`Не удалось загрузить страницу ${result.page} сайта после ${LIS_PAGE_MAX_RETRIES + 1} попыток.`);
                 }
-                if (options.queueFailedPages) failedLisPagesQueue.push(result.page);
+                if (options.queueFailedPages) {
+                    (options.failedPagesQueue || failedLisPagesQueue).push(result.page);
+                }
                 updateLisProgress(operation);
                 return;
             }
@@ -3445,10 +3885,12 @@
         const lisWorkers = Array(Math.min(lisPagesConcurrency, pagesCount - 1)).fill(null).map(() => lisPageWorker());
         await Promise.all(lisWorkers);
 
-        if (failedLisPagesQueue.length > 0 && isOperationActive(operation)) {
+        for (let retryRound = 1; retryRound <= FAILED_PAGE_RETRY_QUEUE_ROUNDS && failedLisPagesQueue.length > 0 && isOperationActive(operation); retryRound++) {
+            const currentFailedLisPagesQueue = failedLisPagesQueue;
+            failedLisPagesQueue = [];
             let retryQueueIndex = 0;
             operation.lisProgress = {
-                total: failedLisPagesQueue.length,
+                total: currentFailedLisPagesQueue.length,
                 completed: 0,
                 pagesCount,
                 cardsPendingSteamProcess,
@@ -3459,16 +3901,20 @@
 
             const retryLisPageWorker = async () => {
                 while (isOperationActive(operation)) {
-                    const pageNumber = failedLisPagesQueue[retryQueueIndex++];
+                    const pageNumber = currentFailedLisPagesQueue[retryQueueIndex++];
                     if (!pageNumber) return;
 
                     updateLisProgress(operation);
                     const result = await loadMarketPage(pageNumber);
-                    await handleLisPageResult(result, { isRetry: true });
+                    await handleLisPageResult(result, {
+                        isRetry: true,
+                        queueFailedPages: retryRound < FAILED_PAGE_RETRY_QUEUE_ROUNDS,
+                        failedPagesQueue: failedLisPagesQueue
+                    });
                 }
             };
 
-            const retryWorkers = Array(Math.min(lisPagesConcurrency, failedLisPagesQueue.length)).fill(null).map(() => retryLisPageWorker());
+            const retryWorkers = Array(Math.min(lisPagesConcurrency, currentFailedLisPagesQueue.length)).fill(null).map(() => retryLisPageWorker());
             await Promise.all(retryWorkers);
         }
 
