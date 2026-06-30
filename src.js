@@ -586,6 +586,10 @@
         return parseFloat(String(text || '').replace(/[^0-9.,]/g, '').replace(',', '.'));
     }
 
+    function parseKeysStoreMarketPrice(text) {
+        return parseMarketPrice(String(text || '').replace(/[+-]?\s*\d+(?:[.,]\d+)?\s*%.*$/g, ''));
+    }
+
     function getTopLevelMatches(root, selector) {
         const candidates = Array.from(root.querySelectorAll(selector));
         return candidates.filter(card => !candidates.some(other => other !== card && other.contains(card)));
@@ -661,10 +665,17 @@
         if (/^(tf2|dota2|cs2|csgo|rust)$/i.test(slug)) return '';
 
         try {
-            return normalizeItemName(decodeURIComponent(slug).replace(/[-_]+/g, ' '));
+            return normalizeKeysStoreSlugName(decodeURIComponent(slug));
         } catch (e) {
-            return normalizeItemName(slug.replace(/[-_]+/g, ' '));
+            return normalizeKeysStoreSlugName(slug);
         }
+    }
+
+    function normalizeKeysStoreSlugName(slug) {
+        return normalizeItemName(String(slug || '')
+            .replace(/[-_]+/g, ' ')
+            .replace(/\b\w/g, char => char.toUpperCase())
+            .replace(/\bCo\b/g, 'Co.'));
     }
 
     function isLikelyKeysStoreItemName(value) {
@@ -678,25 +689,89 @@
     }
 
     function getKeysStoreMarketHashNameFromCard(card) {
-        const textValues = [];
+        const explicitValues = [];
+        const imageValues = [];
+        const linkValues = [];
         const hrefValues = [];
-        const addTextValue = value => {
-            if (isLikelyKeysStoreItemName(value)) textValues.push(normalizeItemName(value));
+        const addTextValue = (target, value) => {
+            if (isLikelyKeysStoreItemName(value)) target.push(normalizeItemName(value));
         };
 
-        ['data-market-hash-name', 'data-market-name', 'data-item-name', 'data-name', 'data-title', 'title', 'aria-label'].forEach(attr => addTextValue(card.getAttribute?.(attr) || ''));
+        ['data-market-hash-name', 'data-market-name', 'data-item-name', 'data-name', 'data-title', 'title', 'aria-label'].forEach(attr => addTextValue(explicitValues, card.getAttribute?.(attr) || ''));
+        card.querySelectorAll?.('img[alt], img[title]')?.forEach(image => {
+            ['alt', 'title'].forEach(attr => addTextValue(imageValues, image.getAttribute(attr) || ''));
+        });
 
         getKeysStoreItemLinks(card).forEach(link => {
-            ['data-market-hash-name', 'data-market-name', 'data-item-name', 'data-name', 'data-title', 'title', 'aria-label'].forEach(attr => addTextValue(link.getAttribute(attr) || ''));
-            link.querySelectorAll('img[alt], img[title], [data-market-hash-name], [data-market-name], [data-item-name], [data-name], [data-title], [title], [aria-label]').forEach(element => {
-                ['data-market-hash-name', 'data-market-name', 'data-item-name', 'data-name', 'data-title', 'title', 'aria-label', 'alt'].forEach(attr => addTextValue(element.getAttribute(attr) || ''));
+            ['data-market-hash-name', 'data-market-name', 'data-item-name', 'data-name', 'data-title', 'title', 'aria-label'].forEach(attr => addTextValue(linkValues, link.getAttribute(attr) || ''));
+            link.querySelectorAll('img[alt], img[title]').forEach(image => {
+                ['alt', 'title'].forEach(attr => addTextValue(imageValues, image.getAttribute(attr) || ''));
+            });
+            link.querySelectorAll('[data-market-hash-name], [data-market-name], [data-item-name], [data-name], [data-title], [title], [aria-label]').forEach(element => {
+                ['data-market-hash-name', 'data-market-name', 'data-item-name', 'data-name', 'data-title', 'title', 'aria-label'].forEach(attr => addTextValue(linkValues, element.getAttribute(attr) || ''));
             });
             hrefValues.push(getKeysStoreMarketHashNameFromHref(link.getAttribute('href')));
         });
 
-        return textValues.sort((a, b) => b.length - a.length)[0]
+        return explicitValues.find(Boolean)
+            || imageValues.find(Boolean)
+            || linkValues.find(Boolean)
             || hrefValues.map(normalizeItemName).find(Boolean)
             || '';
+    }
+
+    function getKeysStoreCardFromLink(link, cardRoot, adapter) {
+        if (!link || !cardRoot) return null;
+
+        let current = link;
+        while (current?.parentElement && current.parentElement !== cardRoot) {
+            current = current.parentElement;
+        }
+
+        if (!current || current === cardRoot) return null;
+        if (!adapter.getPriceElement(current) || !getKeysStoreMarketHashNameFromCard(current)) return null;
+
+        return current;
+    }
+
+    function countDirectKeysStoreCards(container, adapter) {
+        if (!container?.children) return 0;
+
+        return Array.from(container.children)
+            .filter(child => getKeysStoreItemLinks(child).length === 1
+                && adapter.getPriceElement(child)
+                && getKeysStoreMarketHashNameFromCard(child))
+            .length;
+    }
+
+    function getElementDepth(element) {
+        let depth = 0;
+        for (let current = element; current?.parentElement; current = current.parentElement) depth++;
+
+        return depth;
+    }
+
+    function getKeysStorePriceElement(card, adapter) {
+        if (isValidPrice(adapter.parsePrice(card.getAttribute?.('data-price')))) return card;
+
+        const candidates = Array.from(card.querySelectorAll('[data-price], [class*="price" i], [class*="cost" i], [class*="amount" i], [class*="value" i], span, div'))
+            .filter(element => !element.closest('.steam-highest-buy-order-link[data-lis-helper-badge="true"]'));
+
+        const cleanPriceElement = candidates.find(element => {
+            const text = normalizeItemName(element.getAttribute('data-price') || element.textContent || '');
+            if (!/[₽$€£¥₴₸₹]|руб\.?|USD|EUR/i.test(text) || !isValidPrice(adapter.parsePrice(text))) return false;
+
+            const childText = normalizeItemName(Array.from(element.children).map(child => child.textContent || '').join(' '));
+            return !/%/.test(childText) && !/[+-]\s*\d+(?:[.,]\d+)?\s*%/.test(text);
+        });
+        if (cleanPriceElement) return cleanPriceElement;
+
+        return candidates.find(element => {
+            const text = normalizeItemName(element.getAttribute('data-price') || element.textContent || '');
+            return /[₽$€£¥₴₸₹]|руб\.?|USD|EUR/i.test(text)
+                && !/%/.test(text)
+                && isValidPrice(adapter.parsePrice(text));
+        }) || null;
     }
 
     function loadMarketHtmlPage(adapter, pageNumber, { signal, baseUrl, searchParams }) {
@@ -704,6 +779,10 @@
         pageSearchParams.set('page', pageNumber);
         const targetUrl = `${baseUrl}?${pageSearchParams.toString()}`;
 
+        return loadMarketHtmlFromUrl(adapter, pageNumber, targetUrl, signal);
+    }
+
+    function loadMarketHtmlFromUrl(adapter, pageNumber, targetUrl, signal) {
         return fetch(targetUrl, { signal }).then(async response => {
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
@@ -719,6 +798,19 @@
 
             return { page: pageNumber, cards };
         });
+    }
+
+    function buildKeysStorePageUrl(pageNumber, { baseUrl, searchParams }) {
+        const url = new URL(baseUrl);
+        url.pathname = url.pathname.replace(/\/page\/\d+\/?$/i, '').replace(/\/$/, '');
+        if (pageNumber > 1) url.pathname = `${url.pathname}/page/${pageNumber}`;
+        url.search = new URLSearchParams(searchParams).toString();
+
+        return url.toString();
+    }
+
+    function loadKeysStoreMarketPage(adapter, pageNumber, { signal, baseUrl, searchParams }) {
+        return loadMarketHtmlFromUrl(adapter, pageNumber, buildKeysStorePageUrl(pageNumber, { baseUrl, searchParams }), signal);
     }
 
     function detectAppId(defaultAppId = 252490) {
@@ -794,6 +886,43 @@
         if (!item?.slugified_name) return '';
 
         return `${getAvanLocalePrefix()}/market/${getAvanGameSlug(item.app_id)}/${item.slugified_name}`;
+    }
+
+    function getAvanMarketHashNameFromHref(href) {
+        if (!href) return '';
+
+        let pathname = href;
+        try {
+            pathname = new URL(href, window.location.origin).pathname;
+        } catch (e) {
+            pathname = href.split('?')[0].split('#')[0];
+        }
+
+        const match = pathname.match(/(?:^|\/)market\/(?:cs|cs2|csgo|dota2|rust|tf2)\/([^/?#]+)\/?$/i);
+        if (!match) return '';
+
+        return normalizeItemName(
+            decodeURIComponent(match[1])
+                .replace(/[-_]+/g, ' ')
+                .replace(/\b\w/g, char => char.toUpperCase())
+        );
+    }
+
+    function getAvanMarketHashNameFromCard(card) {
+        const explicitName = normalizeItemName(card?.getAttribute?.('data-market-hash-name'));
+        if (explicitName) return explicitName;
+
+        const nameText = normalizeItemName(card?.querySelector?.('[class*="marketGunCardNameItemName"]')?.textContent || '');
+        if (nameText) return nameText;
+
+        const imageName = Array.from(card?.querySelectorAll?.('img[alt]') || [])
+            .map(image => normalizeItemName(image.getAttribute('alt')))
+            .find(alt => alt && !/^(flash|image|skin)$/i.test(alt));
+        if (imageName) return imageName;
+
+        return Array.from(card?.querySelectorAll?.('a[href]') || [])
+            .map(link => getAvanMarketHashNameFromHref(link.getAttribute('href')))
+            .find(Boolean) || '';
     }
 
     function getAvanCartItems() {
@@ -980,7 +1109,7 @@
                 || card.querySelector('[class*="marketGunCardPrice"]');
         },
         parsePrice(text) {
-            return parseMarketPrice(text);
+            return parseKeysStoreMarketPrice(text);
         },
         getDiffPercent(card) {
             const cardText = normalizeItemName(
@@ -1102,7 +1231,17 @@
             && window.location.pathname.includes('/skins/'),
         getGridContainer(root = document) {
             const containers = Array.from(root.querySelectorAll(this.gridSelector));
-            return containers.find(container => getKeysStoreItemLinks(container).length >= 2) || null;
+            const directGrid = containers
+                .map(container => ({ container, cardsCount: countDirectKeysStoreCards(container, this) }))
+                .filter(candidate => candidate.cardsCount >= 2)
+                .sort((a, b) => b.cardsCount - a.cardsCount)[0];
+
+            if (directGrid) return directGrid.container;
+
+            return containers
+                .filter(container => getKeysStoreItemLinks(container).length >= 2)
+                .sort((a, b) => getElementDepth(b) - getElementDepth(a))[0]
+                || null;
         },
         getCards(root = document) {
             const grid = this.getGridContainer(root);
@@ -1111,17 +1250,11 @@
             const seen = new Set();
 
             getKeysStoreItemLinks(cardRoot).forEach(link => {
-                let card = null;
-                let current = link;
-                for (let depth = 0; current && current !== cardRoot && depth < 8; depth++, current = current.parentElement) {
-                    if (this.getPriceElement(current) && getKeysStoreMarketHashNameFromCard(current)) {
-                        card = current;
-                        break;
-                    }
-                }
+                const card = getKeysStoreCardFromLink(link, cardRoot, this);
 
                 if (!card || seen.has(card) || !this.getPriceElement(card) || !getKeysStoreMarketHashNameFromCard(card)) return;
 
+                card.classList.add('keys-store-market-card');
                 seen.add(card);
                 cards.push(card);
             });
@@ -1131,35 +1264,17 @@
             return cards.filter(card => card.ownerDocument === root || root.contains(card));
         },
         isCard(card) {
-            return Boolean(card && getKeysStoreMarketHashNameFromCard(card) && this.getPriceElement(card));
+            return Boolean(this.matchesLocation()
+                && card
+                && getKeysStoreItemLinks(card).length > 0
+                && getKeysStoreMarketHashNameFromCard(card)
+                && this.getPriceElement(card));
         },
         getPriceElement(card) {
-            if (isValidPrice(this.parsePrice(card.getAttribute?.('data-price')))) return card;
-
-            const directSelectors = [
-                '[data-price]',
-                '[class*="price" i]',
-                '[class*="cost" i]',
-                '[class*="amount" i]',
-                '[class*="value" i]'
-            ];
-
-            for (const selector of directSelectors) {
-                const element = card.querySelector(selector);
-                const dataPrice = element?.getAttribute('data-price') || '';
-                const text = element?.textContent || '';
-                if (element && isValidPrice(this.parsePrice(dataPrice || text)) && (dataPrice || /[₽$€£¥₴₸₹]|руб\.?|USD|EUR/i.test(text))) {
-                    return element;
-                }
-            }
-
-            const textNodes = Array.from(card.querySelectorAll('*'))
-                .filter(element => !element.closest('.steam-highest-buy-order-link[data-lis-helper-badge="true"]'));
-            return textNodes.find(element => /[₽$€£¥₴₸₹]|руб\.?|USD|EUR/i.test(element.textContent || '')
-                && isValidPrice(this.parsePrice(element.textContent))) || null;
+            return getKeysStorePriceElement(card, this);
         },
         parsePrice(text) {
-            return parseMarketPrice(text);
+            return parseKeysStoreMarketPrice(text);
         },
         getDiffPercent(card) {
             const explicitText = getFirstMatchingText(card, [
@@ -1184,7 +1299,7 @@
             return detectAppId(440);
         },
         async loadPage(pageNumber, { signal, baseUrl, searchParams }) {
-            return loadMarketHtmlPage(this, pageNumber, { signal, baseUrl, searchParams });
+            return loadKeysStoreMarketPage(this, pageNumber, { signal, baseUrl, searchParams });
         }
     };
 
@@ -1282,6 +1397,11 @@
     }
 
     function getMarketHashNameFromCard(totalCard, appId) {
+        if (avanMarketAdapter.isCard(totalCard)) {
+            const avanName = getAvanMarketHashNameFromCard(totalCard);
+            if (avanName) return avanName;
+        }
+
         if (keysStoreMarketAdapter.isCard(totalCard)) {
             const keysStoreName = getKeysStoreMarketHashNameFromCard(totalCard);
             if (keysStoreName) return keysStoreName;
@@ -2092,6 +2212,18 @@
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
+            }
+            .keys-store-market-card {
+                position: relative !important;
+                overflow: hidden !important;
+            }
+            .keys-store-market-card .steam-highest-buy-order-link[data-lis-helper-badge="true"] {
+                top: 32px !important;
+                left: 12px !important;
+                right: 12px !important;
+                width: auto !important;
+                max-width: calc(100% - 24px) !important;
+                margin: 0 !important;
             }
             #lis-helper-panel,
             #lis-helper-panel * {
@@ -3610,8 +3742,10 @@
                     let itemName = getMarketHashNameFromCard(totalCard, currentAppId);
 
                     if (itemName) {
+                        const marketAdapter = getMarketAdapterForCard(totalCard);
                         const steamLink = document.createElement('a');
                         steamLink.className = 'steam-highest-buy-order-link';
+                        if (marketAdapter.id === 'keys-store') steamLink.classList.add('keys-store-steam-badge');
                         steamLink.setAttribute('data-lis-helper-badge', 'true');
                         steamLink.target = '_blank';
                         steamLink.style = `
@@ -3626,7 +3760,6 @@
                         steamLink.innerText = 'Загружаю';
                         attachProfitTooltip(steamLink);
 
-                        const marketAdapter = getMarketAdapterForCard(totalCard);
                         const lisPriceElem = marketAdapter.getPriceElement(totalCard);
                         const lisPrice = lisPriceElem ? marketAdapter.parsePrice(lisPriceElem.getAttribute('data-price') || lisPriceElem.innerText) : 0;
                         steamLink.setAttribute('data-lis-price', lisPrice);
