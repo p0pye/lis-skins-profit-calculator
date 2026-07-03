@@ -191,8 +191,12 @@
         return encodeURIComponent(marketHashName).replace(/[!'()*|]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
     }
 
-    function buildSteamListingUrl(appId, marketHashName) {
-        return `https://steamcommunity.com/market/listings/${appId}/${encodeSteamMarketHashName(marketHashName)}`;
+    function buildSteamListingUrl(appId, marketHashName, searchParams = null) {
+        const url = new URL(`https://steamcommunity.com/market/listings/${appId}/${encodeSteamMarketHashName(marketHashName)}`);
+        Object.entries(searchParams || {}).forEach(([key, value]) => {
+            if (value !== null && value !== undefined && value !== '') url.searchParams.set(key, value);
+        });
+        return url.toString();
     }
 
     function formatCurrency(value) {
@@ -1033,6 +1037,117 @@
             if (elementName) return elementName;
 
             return this.cleanName(link?.querySelector('img')?.getAttribute('alt'));
+        },
+        normalizeSteamMarketHashName(marketHashName, appId) {
+            let normalized = normalizeText(marketHashName);
+            if (appId !== 730) return normalized;
+
+            normalized = normalized.replace(/\s+\(Not Painted\)$/i, '');
+            normalized = normalized.replace(/^StatTrak™?\s+★\s+/i, '★ StatTrak™ ');
+            normalized = normalized.replace(/^★\s+StatTrak™?\s+StatTrak™?\s+/i, '★ StatTrak™ ');
+            normalized = normalized.replace(/^Souvenir\s+★\s+/i, '★ Souvenir ');
+            normalized = normalized.replace(/^★\s+Souvenir\s+Souvenir\s+/i, '★ Souvenir ');
+            normalized = normalized.replace(/^Souvenir\s+(.+\s+Souvenir\s+(?:Highlight\s+)?Package)$/i, '$1');
+            normalized = normalized.replace(
+                /\b(Gamma Doppler)\s+(Emerald|Phase\s*[1-4])(?=\s*(?:\(|$))/i,
+                '$1'
+            );
+            normalized = normalized.replace(
+                /\b(Doppler)\s+(Ruby|Sapphire|Black Pearl|Phase\s*[1-4])(?=\s*(?:\(|$))/i,
+                '$1'
+            );
+
+            return normalizeText(normalized);
+        },
+        getCsExteriorText(card) {
+            const cardText = normalizeText(card.textContent);
+            const fullWearMatch = cardText.match(/\b(Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\b/i);
+            if (fullWearMatch) return fullWearMatch[1];
+
+            const wearAliases = {
+                FN: 'Factory New',
+                MW: 'Minimal Wear',
+                FT: 'Field-Tested',
+                WW: 'Well-Worn',
+                BS: 'Battle-Scarred'
+            };
+            const shortWearMatch = cardText.match(/(?:^|[\s/|])(?:FN|MW|FT|WW|BS)(?=$|[\s/|])/i);
+            return shortWearMatch ? wearAliases[shortWearMatch[0].replace(/[\s/|]/g, '').toUpperCase()] || '' : '';
+        },
+        getCsExteriorCategoryValue(exteriorText) {
+            const exteriorCategories = {
+                'factory new': 'WearCategory0',
+                'minimal wear': 'WearCategory1',
+                'field-tested': 'WearCategory2',
+                'well-worn': 'WearCategory3',
+                'battle-scarred': 'WearCategory4'
+            };
+            return exteriorCategories[normalizeText(exteriorText).toLowerCase()] || '';
+        },
+        getNameCandidates(card) {
+            const rootCandidates = [];
+            const nestedCandidates = [];
+            const addCandidate = (target, value) => {
+                const normalized = this.cleanName(value);
+                if (normalized) target.push(normalized);
+            };
+
+            ['data-market-hash-name', 'data-market-name', 'data-item-name', 'data-name', 'data-title', 'aria-label']
+                .forEach(attr => addCandidate(rootCandidates, card.getAttribute?.(attr)));
+
+            card.querySelectorAll?.('[data-market-hash-name], [data-market-name], [data-item-name], [data-name], [data-title], [aria-label], img[alt], img[title], a[title]')?.forEach(element => {
+                ['data-market-hash-name', 'data-market-name', 'data-item-name', 'data-name', 'data-title', 'aria-label', 'alt', 'title']
+                    .forEach(attr => addCandidate(nestedCandidates, element.getAttribute?.(attr)));
+            });
+
+            const titleText = this.getNameText(this.getNameElement(card));
+            return { rootCandidates, titleText, nestedCandidates };
+        },
+        getBestMarketHashName(card, appId) {
+            if (appId !== 730) return this.getName(card);
+
+            const { rootCandidates, titleText, nestedCandidates } = this.getNameCandidates(card);
+            const wearPattern = /\((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)$/i;
+            const allCandidates = [...rootCandidates, titleText, ...nestedCandidates].filter(Boolean);
+
+            return allCandidates.find(candidate => wearPattern.test(candidate))
+                || rootCandidates[0]
+                || titleText
+                || nestedCandidates.sort((a, b) => b.length - a.length)[0]
+                || this.getName(card);
+        },
+        getSteamMarketHashName(card) {
+            const appId = this.getAppId();
+            let itemName = this.getBestMarketHashName(card, appId);
+            if (!itemName || appId !== 730) return this.normalizeSteamMarketHashName(itemName, appId);
+
+            const cardText = normalizeText(card.textContent);
+            const exteriorText = this.getCsExteriorText(card);
+            const wearPattern = /\((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)$/i;
+            const hasStatTrakPrefix = /^StatTrak™?\s+/i.test(itemName) || /^★\s+StatTrak™?\s+/i.test(itemName);
+            const hasSouvenirPrefix = /^Souvenir\s+/i.test(itemName) || /^★\s+Souvenir\s+/i.test(itemName);
+
+            if (/(?:^|[\s/|])ST™?(?=$|[\s/|])|StatTrak™?/i.test(cardText) && !hasStatTrakPrefix) {
+                itemName = `StatTrak™ ${itemName}`;
+            } else if (/(?:^|[\s/|])Souvenir(?=$|[\s/|])/i.test(cardText) && !hasSouvenirPrefix) {
+                itemName = `Souvenir ${itemName}`;
+            }
+
+            if (exteriorText && !wearPattern.test(itemName)) {
+                itemName = `${itemName} (${exteriorText})`;
+            }
+
+            return this.normalizeSteamMarketHashName(itemName, appId);
+        },
+        getSteamListingSearchParams(card) {
+            const appId = this.getAppId();
+            if (appId !== 730) return null;
+
+            const exteriorCategory = this.getCsExteriorCategoryValue(this.getCsExteriorText(card));
+            return exteriorCategory ? { category_Exterior: exteriorCategory } : null;
+        },
+        getSteamListingUrl(card, marketHashName) {
+            return buildSteamListingUrl(this.getAppId(), marketHashName, this.getSteamListingSearchParams(card));
         },
         getPriceElement(card) {
             const selectors = ['[data-price]', '.price', '[class*="price" i]', 'div', 'span'];
@@ -2206,11 +2321,12 @@
 
         const cardAdapter = getCardAdapter(card, adapter);
         const name = cardAdapter.getName(card);
+        const steamMarketHashName = cardAdapter.getSteamMarketHashName?.(card) || name;
         const sitePrice = cardAdapter.getPrice(card);
         const appId = cardAdapter.getAppId();
         const badge = createBadge(card, cardAdapter);
 
-        if (!name) {
+        if (!steamMarketHashName) {
             updateBadgeWithError(card, badge, 'Имя не найдено');
             operation.steamDone++;
             updateStatus(operation);
@@ -2223,11 +2339,12 @@
             return;
         }
 
-        const targetUrl = buildSteamListingUrl(appId, name);
+        const targetUrl = cardAdapter.getSteamListingUrl?.(card, steamMarketHashName)
+            || buildSteamListingUrl(appId, steamMarketHashName);
         badge.href = targetUrl;
 
         try {
-            const result = await fetchSteamBestBuyOrder(appId, name);
+            const result = await fetchSteamBestBuyOrder(appId, steamMarketHashName);
             if (result.status === 'not-found') {
                 updateBadgeWithError(card, badge, 'Предмет не найден', CONFIG.colors.notFound);
             } else if (result.status === 'no-orders') {
