@@ -72,10 +72,18 @@
         filtered: 'data-profit-helper-filtered',
         profit: 'data-calculated-profit',
         profitPercent: 'data-calculated-profit-percent',
+        result: 'data-profit-helper-result',
         queued: 'data-profit-helper-queued',
         marketHashName: 'data-market-hash-name',
         price: 'data-price',
         discount: 'data-discount'
+    };
+
+    const RESULT_STATUS = {
+        success: 'success',
+        error: 'error',
+        noOrders: 'no-orders',
+        notFound: 'not-found'
     };
 
     let panelInjected = false;
@@ -117,6 +125,7 @@
         steamQueueRunning = false;
         setStartButtonLoading(false);
         setStatus(text);
+        updateRetryErrorsButton();
     }
 
     function cancelOperation() {
@@ -639,6 +648,16 @@
                 padding: 9px !important; color: #fff !important; background: ${CONFIG.colors.excellent};
                 font-weight: bold !important; text-align: center !important; line-height: 1.2 !important;
             }
+            #retry-errors-combine {
+                display: none !important; align-items: center !important; justify-content: center !important;
+                width: 100% !important; min-height: 33px !important; margin-top: 8px !important;
+                border: 0 !important; border-radius: 4px !important; cursor: pointer !important;
+                padding: 9px !important; color: #fff !important; background: ${CONFIG.colors.panelSecondary};
+                font-weight: bold !important; text-align: center !important; line-height: 1.2 !important;
+            }
+            #retry-errors-combine[data-visible="true"] {
+                display: flex !important;
+            }
             .profit-button-progress-bar {
                 position: absolute; top: 0; bottom: 0; left: 0; width: 0%;
                 background: ${CONFIG.colors.excellent}; transition: width .25s ease; pointer-events: none;
@@ -697,6 +716,7 @@
                 ${settingRow('Мин. выгода, от %:', 'min-profit-input', saved.minProfit, -100, 30, CONFIG.colors.negative, 'Скрывать карточки ниже этой выгоды после расчета.')}
                 ${settingRow('Строк в таблице:', 'tooltip-rows-input', saved.tooltipRows, 1, 20, CONFIG.colors.panelAccent, 'Сколько строк заявок показывать в таблице при наведении.')}
                 <button id="start-combine" type="button">Найти выгодные</button>
+                <button id="retry-errors-combine" type="button">Повторить обработку ошибочных</button>
                 <div id="combine-status"></div>
             </div>
         `;
@@ -735,6 +755,8 @@
         });
 
         document.getElementById('start-combine')?.addEventListener('click', runSearch);
+        document.getElementById('retry-errors-combine')?.addEventListener('click', runRetryErroredCards);
+        updateRetryErrorsButton();
     }
 
     /*************************************************************************
@@ -763,6 +785,7 @@
             card.removeAttribute(ATTRIBUTE.filtered);
             card.removeAttribute(ATTRIBUTE.profit);
             card.removeAttribute(ATTRIBUTE.profitPercent);
+            card.removeAttribute(ATTRIBUTE.result);
             card.removeAttribute(ATTRIBUTE.queued);
         });
         adapter.afterReset?.();
@@ -1241,6 +1264,7 @@
             card.removeAttribute(ATTRIBUTE.filtered);
             card.removeAttribute(ATTRIBUTE.profit);
             card.removeAttribute(ATTRIBUTE.profitPercent);
+            card.removeAttribute(ATTRIBUTE.result);
             card.removeAttribute(ATTRIBUTE.queued);
         },
         makeCard(item) {
@@ -1590,7 +1614,7 @@
             card.setAttribute(ATTRIBUTE.price, String(price));
             if (discount !== null && discount > 0) card.setAttribute(ATTRIBUTE.discount, `-${discount}%`);
             else card.removeAttribute(ATTRIBUTE.discount);
-            [ATTRIBUTE.processed, ATTRIBUTE.filtered, ATTRIBUTE.profit, ATTRIBUTE.profitPercent, ATTRIBUTE.queued].forEach(attribute => {
+            [ATTRIBUTE.processed, ATTRIBUTE.filtered, ATTRIBUTE.profit, ATTRIBUTE.profitPercent, ATTRIBUTE.result, ATTRIBUTE.queued].forEach(attribute => {
                 card.removeAttribute(attribute);
             });
             card.querySelectorAll('.steam-highest-buy-order-link[data-profit-helper-badge="true"]').forEach(badge => badge.remove());
@@ -2143,10 +2167,43 @@
         });
     }
 
-    function updateBadgeWithError(card, badge, text, color = CONFIG.colors.negative) {
+    function getErroredCards(adapter) {
+        return adapter.getCards()
+            .filter(card => card.isConnected && card.getAttribute(ATTRIBUTE.result) === RESULT_STATUS.error);
+    }
+
+    function updateRetryErrorsButton(adapter = getCurrentAdapter()) {
+        const button = document.getElementById('retry-errors-combine');
+        if (!button) return;
+
+        const errorsCount = adapter ? getErroredCards(adapter).length : 0;
+        button.dataset.visible = errorsCount > 0 && !currentOperation ? 'true' : 'false';
+        button.innerText = errorsCount > 0
+            ? `Повторить ошибочные: ${errorsCount}`
+            : 'Повторить обработку ошибочных';
+    }
+
+    function hideRetryErrorsButton() {
+        const button = document.getElementById('retry-errors-combine');
+        if (button) button.dataset.visible = 'false';
+    }
+
+    function resetCardForRetry(card) {
+        card.querySelectorAll('.steam-highest-buy-order-link[data-profit-helper-badge="true"]').forEach(badge => badge.remove());
+        card.removeAttribute(ATTRIBUTE.processed);
+        card.removeAttribute(ATTRIBUTE.filtered);
+        card.removeAttribute(ATTRIBUTE.profit);
+        card.removeAttribute(ATTRIBUTE.profitPercent);
+        card.removeAttribute(ATTRIBUTE.result);
+        card.removeAttribute(ATTRIBUTE.queued);
+        card.style.display = '';
+    }
+
+    function updateBadgeWithError(card, badge, text, color = CONFIG.colors.negative, resultStatus = RESULT_STATUS.error) {
         badge.innerText = text;
         badge.style.background = color;
         card.setAttribute(ATTRIBUTE.processed, '1');
+        card.setAttribute(ATTRIBUTE.result, resultStatus);
         card.setAttribute(ATTRIBUTE.profit, '-999999');
         card.removeAttribute(ATTRIBUTE.profitPercent);
     }
@@ -2167,6 +2224,7 @@
         card.setAttribute(ATTRIBUTE.profit, String(sale.netProfit));
         card.setAttribute(ATTRIBUTE.profitPercent, String(profitPercent));
         card.setAttribute(ATTRIBUTE.processed, '1');
+        card.setAttribute(ATTRIBUTE.result, RESULT_STATUS.success);
 
         const orderText = rows?.[0]?.ordersCount ? ` [${rows[0].ordersCount} шт.]` : '';
         badge.innerText = `${formatCurrency(steamPrice)}${orderText} (${sale.netProfit >= 0 ? '+' : ''}${formatCurrency(sale.netProfit)}, ${profitPercent >= 0 ? '+' : ''}${profitPercent.toFixed(2)}%)`;
@@ -2297,14 +2355,16 @@
     }
 
     function getResultStats(adapter) {
-        const stats = { total: 0, profitable: 0, errors: 0, noOrders: 0 };
+        const stats = { total: 0, profitable: 0, errors: 0, noOrders: 0, notFound: 0 };
         adapter.getCards().forEach(card => {
             if (!card.hasAttribute(ATTRIBUTE.processed)) return;
 
             stats.total++;
-            const badgeText = card.querySelector('.steam-highest-buy-order-link[data-profit-helper-badge="true"]')?.innerText || '';
             const profitPercent = parseFloat(card.getAttribute(ATTRIBUTE.profitPercent));
-            if (badgeText === 'Нет заявок') stats.noOrders++;
+            const resultStatus = card.getAttribute(ATTRIBUTE.result);
+            if (resultStatus === RESULT_STATUS.noOrders) stats.noOrders++;
+            else if (resultStatus === RESULT_STATUS.notFound) stats.notFound++;
+            else if (resultStatus === RESULT_STATUS.error) stats.errors++;
             else if (!Number.isFinite(profitPercent)) stats.errors++;
             else if (profitPercent >= 20) stats.profitable++;
         });
@@ -2313,7 +2373,7 @@
 
     function formatResultStats(adapter) {
         const stats = getResultStats(adapter);
-        return `Готово: карточек ${stats.total}, выгодных ${stats.profitable}, ошибок ${stats.errors}, без заявок ${stats.noOrders}`;
+        return `Готово: карточек ${stats.total}, выгодных ${stats.profitable}, ошибок ${stats.errors}, без заявок ${stats.noOrders}, не найдено ${stats.notFound}`;
     }
 
     async function processCard(operation, adapter, card) {
@@ -2346,9 +2406,9 @@
         try {
             const result = await fetchSteamBestBuyOrder(appId, steamMarketHashName);
             if (result.status === 'not-found') {
-                updateBadgeWithError(card, badge, 'Предмет не найден', CONFIG.colors.notFound);
+                updateBadgeWithError(card, badge, 'Предмет не найден', CONFIG.colors.notFound, RESULT_STATUS.notFound);
             } else if (result.status === 'no-orders') {
-                updateBadgeWithError(card, badge, 'Нет заявок', CONFIG.colors.noOrders);
+                updateBadgeWithError(card, badge, 'Нет заявок', CONFIG.colors.noOrders, RESULT_STATUS.noOrders);
             } else {
                 updateBadgeWithProfit(card, badge, result.steamPrice, sitePrice, result.rows);
             }
@@ -2480,6 +2540,50 @@
         }
     }
 
+    async function runRetryErroredCards() {
+        if (currentOperation) {
+            cancelOperation();
+            return;
+        }
+
+        const adapter = getCurrentAdapter();
+        if (!adapter) {
+            showToast('Сайт не поддерживается', 'error');
+            return;
+        }
+
+        const cards = getErroredCards(adapter);
+        if (!cards.length) {
+            updateRetryErrorsButton(adapter);
+            showToast('Ошибочных карточек нет.');
+            return;
+        }
+
+        const operation = createOperation();
+        setStartButtonLoading(true);
+        hideRetryErrorsButton();
+        setStatus(`Повторяю ошибочные карточки: ${cards.length}`);
+
+        try {
+            cards.forEach(card => {
+                resetCardForRetry(card);
+                card.setAttribute(ATTRIBUTE.result, RESULT_STATUS.error);
+            });
+            await runSteamWorkers(operation, adapter, cards);
+            if (!isOperationActive(operation)) return;
+
+            sortAndPrune(adapter);
+            const resultText = formatResultStats(adapter);
+            finishOperation(operation, resultText);
+            updateRetryErrorsButton(adapter);
+            showToast(getErroredCards(adapter).length ? 'Повтор завершен, часть карточек снова с ошибкой.' : 'Ошибочные карточки обработаны.');
+        } catch (error) {
+            showToast(error.message || 'Ошибка выполнения', 'error');
+            finishOperation(operation, error.message || 'Ошибка выполнения');
+            updateRetryErrorsButton(adapter);
+        }
+    }
+
     async function runSearch() {
         if (currentOperation) {
             cancelOperation();
@@ -2494,6 +2598,7 @@
 
         const operation = createOperation();
         setStartButtonLoading(true);
+        hideRetryErrorsButton();
         setStatus('Подготовка...');
 
         try {
@@ -2517,6 +2622,7 @@
                     ? formatResultStats(adapter)
                     : 'Готово. Подходящих карточек нет.';
                 finishOperation(operation, resultText);
+                updateRetryErrorsButton(adapter);
                 showToast(resultText);
                 return;
             }
@@ -2527,10 +2633,12 @@
             sortAndPrune(adapter);
             const resultText = formatResultStats(adapter);
             finishOperation(operation, resultText);
+            updateRetryErrorsButton(adapter);
             showToast('Готово!');
         } catch (error) {
             showToast(error.message || 'Ошибка выполнения', 'error');
             finishOperation(operation, error.message || 'Ошибка выполнения');
+            updateRetryErrorsButton(adapter);
         }
     }
 
