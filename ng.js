@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         lis-skins-profit-calculator
 // @namespace    http://tampermonkey.net
-// @version      17.0
+// @version      19.3
 // @description  lis-skins-profit-calculator
 // @author       p0pye + AI Helper
 // @match        https://lis-skins.com/*/market/*
@@ -21,6 +21,12 @@
 // @match        https://tradeit.gg/steam/store*
 // @match        https://tradeit.gg/*store*
 // @match        https://www.tradeit.gg/*store*
+// @match        https://skinport.com/*
+// @match        https://www.skinport.com/*
+// @match        https://waxpeer.com/*
+// @match        https://www.waxpeer.com/*
+// @match        https://moon.market/*
+// @match        https://www.moon.market/*
 // @icon         https://www.google.com/s2/favicons?domain=lis-skins.com&sz=64
 // @grant        GM_xmlhttpRequest
 // @connect      steamcommunity.com
@@ -41,7 +47,7 @@
     const CONFIG = {
         steamFeeRate: 0.05,
         steamGameFeeRate: 0.10,
-        steamTimeoutMs: 20000,
+        steamTimeoutMs: 8000,
         siteTimeoutMs: 20000,
         steamCacheTtlMs: 5 * 60 * 1000,
         maxSteamCacheEntries: 3000,
@@ -319,6 +325,21 @@
         };
         operation.cleanups.add(cleanup);
         return { signal: controller.signal, cleanup };
+    }
+
+    function waitForOperationDelay(operation, delayMs) {
+        if (!isOperationActive(operation) || delayMs <= 0) return Promise.resolve();
+
+        return new Promise(resolve => {
+            let timerId = null;
+            const finish = () => {
+                if (timerId !== null) clearTimeout(timerId);
+                operation.cleanups.delete(finish);
+                resolve();
+            };
+            timerId = setTimeout(finish, delayMs);
+            operation.cleanups.add(finish);
+        });
     }
 
     /*************************************************************************
@@ -698,6 +719,7 @@
             discount: localStorage.getItem('profit_helper_discount') || '0',
             pages: localStorage.getItem('profit_helper_pages') || '1',
             siteWorkers: localStorage.getItem('profit_helper_site_workers') || '4',
+            skinportDelay: localStorage.getItem('profit_helper_skinport_delay') || '1',
             steamWorkers: localStorage.getItem('profit_helper_steam_workers') || '3',
             minProfit: localStorage.getItem('profit_helper_min_profit') || '-100',
             tooltipRows: localStorage.getItem('profit_helper_tooltip_rows') || '3'
@@ -712,6 +734,7 @@
                 ${settingRow('Скидка, от %:', 'discount-input', saved.discount, 0, 100, CONFIG.colors.panelAccent, 'Минимальная скидка сайта.')}
                 ${settingRow('Страниц сайта:', 'pages-input', saved.pages, 0, 999, CONFIG.colors.panelSecondary, 'Сколько дополнительных страниц сайта загрузить.')}
                 ${settingRow('Потоков сайта:', 'site-workers-input', saved.siteWorkers, 1, 33, CONFIG.colors.neutral, 'Сколько страниц сайта грузить одновременно.')}
+                ${settingRow('Пауза страниц, сек:', 'skinport-delay-input', saved.skinportDelay, 0, 10, CONFIG.colors.neutral, 'Пауза между запросами страниц Skinport в одном потоке.')}
                 ${settingRow('Запросов Steam:', 'steam-workers-input', saved.steamWorkers, 1, 99, CONFIG.colors.panelSuccess, 'Сколько запросов Steam делать одновременно.')}
                 ${settingRow('Мин. выгода, от %:', 'min-profit-input', saved.minProfit, -100, 30, CONFIG.colors.negative, 'Скрывать карточки ниже этой выгоды после расчета.')}
                 ${settingRow('Строк в таблице:', 'tooltip-rows-input', saved.tooltipRows, 1, 20, CONFIG.colors.panelAccent, 'Сколько строк заявок показывать в таблице при наведении.')}
@@ -721,6 +744,16 @@
             </div>
         `;
         document.body.appendChild(panel);
+
+        const adapter = getCurrentAdapter();
+        const hiddenPaginationControls = adapter?.supportsPagination === false
+            ? ['pages-input', 'site-workers-input']
+            : [];
+        if (adapter?.id !== 'skinport') hiddenPaginationControls.push('skinport-delay-input');
+        hiddenPaginationControls.forEach(id => {
+                document.getElementById(id)?.closest('.profit-setting-row')?.style.setProperty('display', 'none');
+                document.getElementById(`${id}-range`)?.style.setProperty('display', 'none', 'important');
+        });
 
         const toggleCollapsed = () => {
             const collapsed = panel.dataset.collapsed !== 'true';
@@ -738,6 +771,7 @@
             ['discount-input', 'profit_helper_discount'],
             ['pages-input', 'profit_helper_pages'],
             ['site-workers-input', 'profit_helper_site_workers'],
+            ['skinport-delay-input', 'profit_helper_skinport_delay'],
             ['steam-workers-input', 'profit_helper_steam_workers'],
             ['min-profit-input', 'profit_helper_min_profit'],
             ['tooltip-rows-input', 'profit_helper_tooltip_rows']
@@ -1747,6 +1781,1046 @@
     };
 
     /*************************************************************************
+     * Adapter: Waxpeer
+     *************************************************************************/
+
+    const WaxpeerAdapter = {
+        id: 'waxpeer',
+        reloadInitialPage: true,
+        maxSiteWorkers: 1,
+        pageLimit: 70,
+        cardTemplate: null,
+        gridElement: null,
+        nativeGridElement: null,
+        nativeGridObserver: null,
+        nativeGridObserverTarget: null,
+        portalResizeObserver: null,
+        portalSyncTimer: null,
+        activeGame: 'csgo',
+        nextCursor: null,
+        hasMore: true,
+        rubPerUsd: NaN,
+        currencyFetchedAt: 0,
+        currencyPromise: null,
+        readinessKey: '',
+        readinessStartedAt: 0,
+        gameByAppId: {
+            730: 'csgo',
+            252490: 'rust',
+            440: 'tf2',
+            570: 'dota2'
+        },
+        appIdByGame: {
+            csgo: 730,
+            rust: 252490,
+            tf2: 440,
+            dota2: 570
+        },
+        matches() {
+            if (!['waxpeer.com', 'www.waxpeer.com'].includes(window.location.hostname)) return false;
+            if (this.gridElement?.isConnected && this.gridElement.id === 'profit-helper-waxpeer-grid') return true;
+
+            const cards = Array.from(document.querySelectorAll('.catalog__list:not(#profit-helper-waxpeer-grid) > .item-card'));
+            const firstImage = cards[0]?.querySelector('a.thumb-link img')?.getAttribute('src') || '';
+            if (!cards.length || !firstImage) return false;
+
+            const readinessKey = `${window.location.pathname}|${cards.length}|${firstImage}`;
+            if (readinessKey !== this.readinessKey) {
+                this.readinessKey = readinessKey;
+                this.readinessStartedAt = Date.now();
+                return false;
+            }
+            return Date.now() - this.readinessStartedAt >= 1200;
+        },
+        getStyles() {
+            return `
+                .waxpeer-generated-card {
+                    position: relative !important;
+                    overflow: visible !important;
+                }
+                .waxpeer-generated-card .steam-highest-buy-order-link[data-profit-helper-badge="true"] {
+                    top: 8px !important;
+                    left: 8px !important;
+                    right: 8px !important;
+                    width: auto !important;
+                    margin: 0 !important;
+                }
+            `;
+        },
+        getGrid(root = document) {
+            if (root === document && this.gridElement?.isConnected) return this.gridElement;
+            const grid = root.querySelector?.('.catalog__list:not(#profit-helper-waxpeer-grid)') || null;
+            if (root === document && grid) this.gridElement = grid;
+            return grid;
+        },
+        getCards(root = document) {
+            const grid = this.getGrid(root);
+            return Array.from(grid?.children || [])
+                .filter(card => card.classList?.contains('item-card'));
+        },
+        ownsCard(card) {
+            return Boolean(card?.classList?.contains('item-card') && card.closest('.catalog__list'));
+        },
+        detectGameFromCards(cards = this.getCards()) {
+            for (const card of cards) {
+                const imageUrls = Array.from(card.querySelectorAll('img'), image => image.currentSrc || image.getAttribute('src') || '');
+                for (const imageUrl of imageUrls) {
+                    const appId = parseInt(imageUrl.match(/\/economy\/image\/class\/(\d+)\//i)?.[1], 10);
+                    if (this.gameByAppId[appId]) return this.gameByAppId[appId];
+                }
+            }
+            return this.activeGame || 'csgo';
+        },
+        detectGameFromPath() {
+            const segments = window.location.pathname.split('/').filter(Boolean);
+            const routeGame = segments.find(segment => this.appIdByGame[segment]);
+            return routeGame || 'csgo';
+        },
+        getAppId() {
+            return this.appIdByGame[this.activeGame] || 730;
+        },
+        prepareReloadGrid(grid) {
+            const nativeGrid = document.querySelector('.catalog__list:not(#profit-helper-waxpeer-grid)');
+            const cards = nativeGrid
+                ? Array.from(nativeGrid.children).filter(card => card.classList?.contains('item-card'))
+                : this.getCards();
+            this.activeGame = this.detectGameFromPath() || this.detectGameFromCards(cards);
+            const nativeTemplate = cards.find(card => !card.classList.contains('waxpeer-generated-card'));
+            if (nativeTemplate) {
+                this.cardTemplate = nativeTemplate.cloneNode(true);
+                this.resetGeneratedCard(this.cardTemplate);
+            }
+
+            if (grid.id !== 'profit-helper-waxpeer-grid') {
+                document.getElementById('profit-helper-waxpeer-grid')?.remove();
+                const generatedGrid = grid.cloneNode(false);
+                generatedGrid.id = 'profit-helper-waxpeer-grid';
+                generatedGrid.style.cssText = 'position:absolute;z-index:20;margin:0;';
+                document.body.appendChild(generatedGrid);
+                this.nativeGridElement = grid;
+                this.gridElement = generatedGrid;
+                this.startPortalSync();
+                grid = generatedGrid;
+            }
+            this.gridElement = grid;
+            this.nextCursor = null;
+            this.hasMore = true;
+            return grid;
+        },
+        startPortalSync() {
+            this.portalResizeObserver?.disconnect();
+            if (this.portalSyncTimer) clearInterval(this.portalSyncTimer);
+
+            const sync = () => {
+                const helperGrid = this.gridElement;
+                if (!helperGrid?.isConnected) return;
+
+                const nativeGrid = this.nativeGridElement?.isConnected
+                    ? this.nativeGridElement
+                    : document.querySelector('.catalog__list:not(#profit-helper-waxpeer-grid)');
+                if (!nativeGrid) return;
+                this.nativeGridElement = nativeGrid;
+                nativeGrid.style.visibility = 'hidden';
+
+                const rect = nativeGrid.getBoundingClientRect();
+                const nativeStyle = window.getComputedStyle(nativeGrid);
+                helperGrid.style.left = `${rect.left + window.scrollX}px`;
+                helperGrid.style.top = `${rect.top + window.scrollY}px`;
+                helperGrid.style.width = `${rect.width}px`;
+                helperGrid.style.display = nativeStyle.display;
+                helperGrid.style.gridTemplateColumns = nativeStyle.gridTemplateColumns;
+                helperGrid.style.columnGap = nativeStyle.columnGap;
+                helperGrid.style.rowGap = nativeStyle.rowGap;
+                nativeGrid.style.minHeight = `${Math.max(rect.height, helperGrid.scrollHeight)}px`;
+                this.clearNativeGrid(nativeGrid);
+            };
+
+            this.portalResizeObserver = new ResizeObserver(sync);
+            this.portalResizeObserver.observe(this.gridElement);
+            this.portalSyncTimer = setInterval(sync, 500);
+            sync();
+        },
+        clearNativeGrid(nativeGrid) {
+            if (this.nativeGridObserverTarget !== nativeGrid) {
+                this.nativeGridObserver?.disconnect();
+                const observer = new MutationObserver(() => {
+                    if (nativeGrid.childElementCount) nativeGrid.replaceChildren();
+                });
+                observer.observe(nativeGrid, { childList: true });
+                this.nativeGridObserver = observer;
+                this.nativeGridObserverTarget = nativeGrid;
+            }
+            if (nativeGrid.childElementCount) nativeGrid.replaceChildren();
+        },
+        resetGeneratedCard(card) {
+            card.classList.add('waxpeer-generated-card');
+            card.querySelectorAll('.steam-highest-buy-order-link[data-profit-helper-badge="true"]').forEach(badge => badge.remove());
+            [
+                ATTRIBUTE.processed,
+                ATTRIBUTE.filtered,
+                ATTRIBUTE.profit,
+                ATTRIBUTE.profitPercent,
+                ATTRIBUTE.result,
+                ATTRIBUTE.queued,
+                ATTRIBUTE.marketHashName,
+                ATTRIBUTE.price,
+                ATTRIBUTE.discount,
+                'data-waxpeer-item-id'
+            ].forEach(attribute => card.removeAttribute(attribute));
+        },
+        getName(card) {
+            return normalizeText(card.getAttribute(ATTRIBUTE.marketHashName)
+                || card.querySelector(':scope > a.sr-only')?.textContent
+                || card.querySelector('a.name')?.textContent);
+        },
+        getSteamMarketHashName(card) {
+            return normalizeText(card.getAttribute(ATTRIBUTE.marketHashName));
+        },
+        getPrice(card) {
+            return parsePrice(card.getAttribute(ATTRIBUTE.price));
+        },
+        getDiscount(card) {
+            return parseDiscountPercent(card.getAttribute(ATTRIBUTE.discount));
+        },
+        async getRubPerUsd(signal) {
+            if (isValidPrice(this.rubPerUsd) && Date.now() - this.currencyFetchedAt < 5 * 60 * 1000) {
+                return this.rubPerUsd;
+            }
+            if (!this.currencyPromise) {
+                this.currencyPromise = (async () => {
+                    const data = await fetchJson(new URL('/api/currencies', window.location.origin).toString(), {
+                        signal,
+                        credentials: 'include'
+                    });
+                    const currencies = Array.isArray(data?.data) ? data.data : [];
+                    const usd = Number(currencies.find(currency => String(currency.type).toUpperCase() === 'USD')?.price);
+                    const rub = Number(currencies.find(currency => String(currency.type).toUpperCase() === 'RUB')?.price);
+                    const rate = rub / usd;
+                    if (!isValidPrice(rate)) throw new Error('Курс USD/RUB Waxpeer не найден');
+                    this.rubPerUsd = rate;
+                    this.currencyFetchedAt = Date.now();
+                    return rate;
+                })().finally(() => {
+                    this.currencyPromise = null;
+                });
+            }
+            return this.currencyPromise;
+        },
+        getItemPriceRub(item) {
+            const milliUsd = Number(item?.price);
+            const price = (milliUsd / 1000) * this.rubPerUsd;
+            return isValidPrice(price) ? Math.round(price * 100) / 100 : NaN;
+        },
+        getItemDiscount(item) {
+            const salePrice = Number(item?.price);
+            const referencePrice = Number(item?.steam_price?.average);
+            if (!isValidPrice(salePrice) || !isValidPrice(referencePrice) || salePrice >= referencePrice) return null;
+            return Math.floor(((referencePrice - salePrice) / referencePrice) * 100);
+        },
+        formatUsd(milliUsd) {
+            const value = Number(milliUsd) / 1000;
+            if (!isValidPrice(value)) return '';
+            return `$${value.toLocaleString('en-US', {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2
+            })}`;
+        },
+        slugifyName(name) {
+            return String(name || '')
+                .normalize('NFKD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .toLowerCase()
+                .replace(/[\u2018\u2019']/g, '')
+                .replace(/[^a-z0-9]+/g, '-')
+                .replace(/^-+|-+$/g, '');
+        },
+        getItemHref(item) {
+            const gamePrefix = this.activeGame === 'csgo' ? '' : `/${this.activeGame}`;
+            return `${gamePrefix}/${this.slugifyName(item.name)}/item/${encodeURIComponent(item.item_id)}`;
+        },
+        getImageUrl(item) {
+            const source = normalizeText(item?.image);
+            if (!source) return '';
+            if (source.startsWith('https://imageproxy.waxpeer.com/')) return source;
+            return `https://imageproxy.waxpeer.com/insecure/rs:fit:300:170:0/g:nowe/f:webp/plain/${source}`;
+        },
+        splitItemName(item) {
+            const name = normalizeText(item.name);
+            const separatorIndex = name.indexOf('|');
+            if (separatorIndex >= 0) {
+                return {
+                    model: normalizeText(name.slice(0, separatorIndex)),
+                    market: normalizeText(item.market_name || name.slice(separatorIndex + 1).replace(/\s+\([^)]*\)$/, ''))
+                };
+            }
+            return {
+                model: normalizeText(item.brand || item.category),
+                market: normalizeText(item.market_name || name)
+            };
+        },
+        makeCard(item) {
+            const marketHashName = normalizeText(item?.name);
+            const sitePrice = this.getItemPriceRub(item);
+            if (!this.cardTemplate || !marketHashName || !item?.item_id || !isValidPrice(sitePrice)) return null;
+
+            const card = this.cardTemplate.cloneNode(true);
+            this.resetGeneratedCard(card);
+            const discount = this.getItemDiscount(item);
+            const itemHref = this.getItemHref(item);
+            const nameParts = this.splitItemName(item);
+            card.setAttribute(ATTRIBUTE.marketHashName, marketHashName);
+            card.setAttribute(ATTRIBUTE.price, String(sitePrice));
+            card.setAttribute('data-waxpeer-item-id', String(item.item_id));
+            if (discount !== null) card.setAttribute(ATTRIBUTE.discount, `-${discount}%`);
+
+            const itemLinks = card.querySelectorAll(':scope > a.sr-only, a.thumb-link, a.name');
+            itemLinks.forEach(link => { link.href = itemHref; });
+            const fullNameLink = card.querySelector(':scope > a.sr-only');
+            if (fullNameLink) fullNameLink.textContent = marketHashName;
+
+            const rarityColor = normalizeText(item.steam_price?.rarity_color);
+            const thumbBackground = card.querySelector('.thumb-bg');
+            if (thumbBackground && rarityColor) thumbBackground.style.color = rarityColor;
+            const imageUrl = this.getImageUrl(item);
+            const itemImages = Array.from(card.querySelectorAll('a.thumb-link img'));
+            const desktopImage = itemImages.find(image => !image.classList.contains('lg:hidden'));
+            const mobileImage = itemImages.find(image => image.classList.contains('lg:hidden'));
+            const retainedImages = new Set([desktopImage, mobileImage].filter(Boolean));
+            itemImages.forEach(image => {
+                if (!retainedImages.has(image)) {
+                    image.parentElement?.remove();
+                    return;
+                }
+                image.src = imageUrl;
+                image.removeAttribute('srcset');
+                image.alt = marketHashName;
+                image.loading = 'lazy';
+                image.decoding = 'async';
+            });
+
+            const modelElement = card.querySelector('.name_model span');
+            if (modelElement) modelElement.textContent = nameParts.model;
+            const marketElement = card.querySelector('.name_market');
+            if (marketElement) marketElement.textContent = nameParts.market;
+
+            const priceRow = Array.from(card.querySelectorAll('div'))
+                .find(element => Array.from(element.children).some(child => child.matches?.('div.inline-flex'))
+                    && Boolean(element.querySelector(':scope > div span.font-medium')));
+            const discountElement = Array.from(priceRow?.children || [])
+                .find(element => element.matches?.('div.inline-flex'));
+            const priceElement = priceRow?.querySelector(':scope > div span.font-medium');
+            if (priceElement) priceElement.textContent = this.formatUsd(item.price);
+            if (discountElement) {
+                discountElement.textContent = discount !== null ? `-${discount}%` : '';
+                discountElement.style.visibility = discount !== null ? '' : 'hidden';
+            }
+
+            const referencePriceElement = card.querySelector(':scope > .absolute span.font-medium');
+            if (referencePriceElement) {
+                const referencePrice = this.formatUsd(item.steam_price?.average);
+                referencePriceElement.textContent = referencePrice;
+                referencePriceElement.style.visibility = referencePrice ? '' : 'hidden';
+            }
+
+            card.querySelectorAll('.stickers--card').forEach(stickerBlock => stickerBlock.remove());
+            const floatBlock = card.querySelector('.float-card');
+            if (floatBlock) {
+                const floatValue = Number(item.float);
+                floatBlock.style.visibility = Number.isFinite(floatValue) ? '' : 'hidden';
+                const values = floatBlock.querySelectorAll(':scope > div > span');
+                if (values[0]) values[0].textContent = normalizeText(item.exterior);
+                if (values[1]) values[1].textContent = Number.isFinite(floatValue) ? floatValue.toFixed(7) : '';
+            }
+
+            const buttons = Array.from(card.querySelectorAll('button'));
+            const cartButton = buttons.find(button => /add .* to cart/i.test(button.getAttribute('aria-label') || ''));
+            if (cartButton) cartButton.style.display = 'none';
+            const buyButton = buttons.find(button => /buy now/i.test(normalizeText(button.textContent))) || buttons.at(-1);
+            if (buyButton) {
+                buyButton.textContent = 'Открыть предмет';
+                buyButton.addEventListener('click', () => window.location.assign(itemHref));
+            }
+            return card;
+        },
+        getRouteFilters() {
+            const localePattern = /^(?:ar|da|de|es|fr|nl|pl|pt|ro|ru|sv|tr|uk|zh)$/i;
+            const segments = window.location.pathname.split('/').filter(Boolean);
+            if (localePattern.test(segments[0] || '')) segments.shift();
+
+            const brandByRoute = {
+                rifles: 'rifle',
+                'sniper-rifles': 'sniper rifle',
+                knives: 'knife',
+                gloves: 'gloves',
+                machineguns: 'machinegun',
+                smgs: 'smg',
+                shotguns: 'shotgun',
+                pistols: 'pistol',
+                other: 'other'
+            };
+            const filters = {};
+            if (brandByRoute[segments[0]]) filters.brand = brandByRoute[segments[0]];
+            if (segments[1]) filters.type = segments[1];
+            return filters;
+        },
+        buildBrowseUrl(cursor = null, context = {}) {
+            const url = new URL(`/api/${this.activeGame}/browse`, window.location.origin);
+            url.searchParams.set('sort', 'DESC');
+            url.searchParams.set('order', 'advised');
+            url.searchParams.set('all', '0');
+            url.searchParams.set('limit', String(this.pageLimit));
+            url.searchParams.set('lang', 'en');
+
+            Object.entries(this.getRouteFilters()).forEach(([key, value]) => url.searchParams.set(key, value));
+            const searchParams = context.searchParams || new URLSearchParams(window.location.search);
+            searchParams.forEach((value, key) => {
+                if (key !== 'cursor') url.searchParams.append(key, value);
+            });
+            if (cursor) url.searchParams.set('cursor', cursor);
+            return url.toString();
+        },
+        async loadPage(pageNumber, context) {
+            if (pageNumber > 1 && (!this.hasMore || !this.nextCursor)) {
+                return { page: pageNumber, cards: [] };
+            }
+
+            await this.getRubPerUsd(context.signal);
+            const cursor = pageNumber > 1 ? this.nextCursor : null;
+            const data = await fetchJson(this.buildBrowseUrl(cursor, context), {
+                signal: context.signal,
+                credentials: 'include'
+            });
+            if (data?.success !== true || !Array.isArray(data.items)) {
+                throw new Error(data?.msg || 'Ошибка API Waxpeer');
+            }
+
+            this.hasMore = data.hasMore === true;
+            this.nextCursor = normalizeText(data.nextCursor);
+            const minDiscount = readNumberInput('discount-input', 0);
+            const cards = data.items
+                .filter(item => {
+                    const discount = this.getItemDiscount(item);
+                    return minDiscount <= 0 || (discount !== null && discount >= minDiscount);
+                })
+                .map(item => this.makeCard(item))
+                .filter(Boolean);
+            return { page: pageNumber, cards };
+        }
+    };
+
+    /*************************************************************************
+     * Adapter: Moon Market
+     *************************************************************************/
+
+    const MoonMarketAdapter = {
+        id: 'moon-market',
+        reloadInitialPage: true,
+        maxSiteWorkers: 4,
+        totalPages: null,
+        rubPerUsd: NaN,
+        matches: () => ['moon.market', 'www.moon.market'].includes(window.location.hostname)
+            && /(?:^|\/)shop(?:\/|$)/i.test(window.location.pathname),
+        getAppId() {
+            const appId = parseInt(new URLSearchParams(window.location.search).get('app_id'), 10);
+            return Number.isFinite(appId) && appId > 0 ? appId : detectAppId(730);
+        },
+        getStyles() {
+            return `
+                .moon-profit-card {
+                    position: relative !important;
+                }
+                .moon-profit-card > .block {
+                    position: relative !important;
+                    overflow: visible !important;
+                }
+                .moon-profit-card .steam-highest-buy-order-link[data-profit-helper-badge="true"] {
+                    top: 8px !important;
+                    left: 8px !important;
+                    right: 8px !important;
+                    display: block !important;
+                    visibility: visible !important;
+                    opacity: 1 !important;
+                }
+            `;
+        },
+        getGrid(root = document) {
+            return root.querySelector?.('.shop .products > ul, .products > ul') || null;
+        },
+        createGrid() {
+            const products = document.querySelector('.shop .products, .products');
+            if (!products) return null;
+
+            let grid = products.querySelector(':scope > ul');
+            if (!grid) {
+                grid = document.createElement('ul');
+                products.replaceChildren(grid);
+            }
+            return grid;
+        },
+        getCards(root = document) {
+            const grid = this.getGrid(root);
+            return Array.from(grid?.querySelectorAll(':scope > li') || [])
+                .filter(card => card.querySelector('.item-name') || card.hasAttribute(ATTRIBUTE.marketHashName));
+        },
+        ownsCard(card) {
+            return Boolean(card?.matches?.('li')
+                && (card.classList.contains('moon-profit-card') || card.closest('.shop .products, .products')));
+        },
+        getBadgeContainer(card) {
+            return card.querySelector(':scope > .block') || card;
+        },
+        getName(card) {
+            return normalizeText(card.getAttribute(ATTRIBUTE.marketHashName)
+                || card.querySelector('.item-name')?.textContent);
+        },
+        getSteamMarketHashName(card) {
+            return this.getName(card);
+        },
+        getPrice(card) {
+            const storedPrice = parsePrice(card.getAttribute(ATTRIBUTE.price));
+            if (isValidPrice(storedPrice)) return storedPrice;
+
+            return parsePrice(card.querySelector('[data-profit-helper-moon-price]')?.textContent
+                || card.querySelector('.price')?.textContent);
+        },
+        getDiscount(card) {
+            return parseDiscountPercent(card.getAttribute(ATTRIBUTE.discount)
+                || card.querySelector('.discount')?.textContent);
+        },
+        parseCurrencyRate(value) {
+            const match = String(value || '').match(/^\s*(\d+(?:[.,]\d+)?)/);
+            return parsePrice(match?.[1]);
+        },
+        readRubPerUsd() {
+            const runtimeValue = window.config_js?.rub;
+            const runtimeRate = this.parseCurrencyRate(runtimeValue);
+            if (isValidPrice(runtimeRate)) return runtimeRate;
+
+            const scriptsText = Array.from(document.scripts)
+                .map(script => script.textContent || '')
+                .find(text => /['"]rub['"]\s*:\s*['"][^'"]+/i.test(text)) || '';
+            const match = scriptsText.match(/['"]rub['"]\s*:\s*['"]([^'"]+)/i);
+            return this.parseCurrencyRate(match?.[1]);
+        },
+        async ensureRubPerUsd(signal) {
+            const runtimeRate = this.readRubPerUsd();
+            if (isValidPrice(runtimeRate)) {
+                this.rubPerUsd = runtimeRate;
+                return runtimeRate;
+            }
+            if (isValidPrice(this.rubPerUsd)) return this.rubPerUsd;
+
+            const doc = await fetchDocument(window.location.href, { signal, credentials: 'include' });
+            const scriptsText = Array.from(doc.scripts).map(script => script.textContent || '').join('\n');
+            const match = scriptsText.match(/['"]rub['"]\s*:\s*['"]([^'"]+)/i);
+            const rate = this.parseCurrencyRate(match?.[1]);
+            if (!isValidPrice(rate)) throw new Error('курс USD/RUB Moon Market не найден');
+
+            this.rubPerUsd = rate;
+            return rate;
+        },
+        getItemPriceRub(item) {
+            const usdPrice = Number(item?.price);
+            if (!isValidPrice(usdPrice) || !isValidPrice(this.rubPerUsd)) return NaN;
+            return Math.round(usdPrice * this.rubPerUsd * 100) / 100;
+        },
+        getItemDiscount(item) {
+            const sitePrice = Number(item?.price);
+            const steamReferencePrice = Number(item?.price_steam);
+            if (!isValidPrice(sitePrice) || !isValidPrice(steamReferencePrice) || sitePrice >= steamReferencePrice) return null;
+            return Math.round(((steamReferencePrice - sitePrice) / steamReferencePrice) * 100);
+        },
+        parseItemFilters(item) {
+            if (item?.filters && typeof item.filters === 'object') return item.filters;
+            try {
+                return JSON.parse(item?.filters || '{}');
+            } catch (_) {
+                return {};
+            }
+        },
+        getProvider(item) {
+            if (item?.provider === 2 || item?.provider === 'igxe') return 'igxe';
+            if (item?.provider === 3 || item?.provider === 'ecosteam') return 'ecosteam';
+            if (item?.provider === 4) return '4';
+            return 'sales_panel';
+        },
+        getItemHref(item) {
+            const locale = window.location.pathname.match(/^\/([a-z]{2})(?:\/|$)/i)?.[1] || 'ru';
+            const url = new URL(`/${locale}/shop/`, window.location.origin);
+            url.searchParams.set('item_name', normalizeText(item?.name));
+            url.searchParams.set('app_id', String(item?.app_id || this.getAppId()));
+            return url.toString();
+        },
+        resetCard(card) {
+            card.querySelectorAll('.steam-highest-buy-order-link[data-profit-helper-badge="true"]').forEach(badge => badge.remove());
+            [
+                ATTRIBUTE.processed,
+                ATTRIBUTE.filtered,
+                ATTRIBUTE.profit,
+                ATTRIBUTE.profitPercent,
+                ATTRIBUTE.result,
+                ATTRIBUTE.queued
+            ].forEach(attribute => card.removeAttribute(attribute));
+        },
+        makeCard(item) {
+            const marketHashName = normalizeText(item?.name);
+            const sitePrice = this.getItemPriceRub(item);
+            if (!marketHashName || !isValidPrice(sitePrice)) return null;
+
+            const filters = this.parseItemFilters(item);
+            const discount = this.getItemDiscount(item);
+            const itemHref = this.getItemHref(item);
+            const provider = this.getProvider(item);
+            const holdDays = Number(item?.hold);
+            const transferText = holdDays > 0
+                ? `${holdDays} дн.`
+                : provider === 'sales_panel' ? 'Мгновенно' : 'до 12 ч.';
+
+            const card = document.createElement('li');
+            card.className = 'moon-profit-card';
+            card.setAttribute(ATTRIBUTE.marketHashName, marketHashName);
+            card.setAttribute(ATTRIBUTE.price, String(sitePrice));
+            if (discount !== null) card.setAttribute(ATTRIBUTE.discount, `-${discount}%`);
+            this.resetCard(card);
+            card.innerHTML = `
+                <div class="block">
+                    <div class="add-to-btn"><button type="button" class="js-add-to-basket">В корзину</button></div>
+                    <div class="head-i">
+                        <div class="price" data-profit-helper-moon-price="true">${escapeHtml(formatCurrency(sitePrice))}</div>
+                        ${discount !== null ? `<div class="discount">-${discount}%</div>` : ''}
+                    </div>
+                    <div class="img"><img src="${escapeHtml(item?.image || '')}" alt="${escapeHtml(marketHashName)}" loading="lazy"></div>
+                    <div class="float-extra">
+                        <div class="l">x${Math.max(1, Number(item?.sell_count) || 1)}${item?.sell_count_exact === false ? '+' : ''}</div>
+                        <div class="r ${holdDays > 0 ? 'locked' : 'instantly'}">${escapeHtml(transferText)}</div>
+                    </div>
+                    <div class="inner red"></div>
+                    <div class="bottom-line red"></div>
+                </div>
+                <a class="profit-helper-moon-item-link" href="${escapeHtml(itemHref)}" style="text-decoration:none">
+                    <div class="item-name">${escapeHtml(marketHashName)}</div>
+                    <div class="item-type">${escapeHtml(filters.type || '')}</div>
+                </a>
+            `;
+
+            const button = card.querySelector('.js-add-to-basket');
+            button.dataset.name = marketHashName;
+            button.dataset.id = String(item?.item_id ?? item?.id ?? '');
+            button.dataset.price = String(item.price);
+            button.dataset.count = String(Math.max(1, Number(item?.sell_count) || 1));
+            button.dataset.provider = provider;
+            button.dataset.unitPrice = String(item?.price_api ?? '');
+            button.dataset.priceBuy = String(item?.price_buy ?? '');
+            button.dataset.priceAuto = String(item?.price_auto ?? '');
+
+            return card;
+        },
+        prepareReloadGrid(grid) {
+            this.totalPages = null;
+            grid.replaceChildren();
+            document.querySelector('.shop .pagination, .pagination')?.replaceChildren();
+            return grid;
+        },
+        buildBrowseUrl(pageNumber, context = {}) {
+            const url = new URL(window.location.pathname, window.location.origin);
+            const sourceParams = context.searchParams || new URLSearchParams(window.location.search);
+            const supportedParams = [
+                'filters', 'search', 'sort', 'float_from', 'float_to', 'price_from', 'price_to'
+            ];
+
+            url.searchParams.set('page_load', 'ajax');
+            url.searchParams.set('url', '/ajax/market2.ajax');
+            url.searchParams.set('currency', 'rub');
+            url.searchParams.set('lang', 'en');
+            url.searchParams.set('app_id', String(this.getAppId()));
+            supportedParams.forEach(key => {
+                const value = sourceParams.get(key);
+                if (value !== null) url.searchParams.set(key, value);
+            });
+            if (!url.searchParams.has('sort')) url.searchParams.set('sort', 'price_desc');
+            url.searchParams.set('page_id', String(pageNumber));
+            return url.toString();
+        },
+        async loadPage(pageNumber, context) {
+            if (this.totalPages !== null && pageNumber > this.totalPages) {
+                return { page: pageNumber, cards: [] };
+            }
+
+            await this.ensureRubPerUsd(context.signal);
+            const data = await fetchJson(this.buildBrowseUrl(pageNumber, context), {
+                signal: context.signal,
+                credentials: 'include'
+            });
+            if (data?.error || !Array.isArray(data?.items)) {
+                throw new Error(data?.error || 'ошибка API Moon Market');
+            }
+
+            const totalPages = Number(data.pagination?.total);
+            if (Number.isFinite(totalPages) && totalPages >= 0) this.totalPages = totalPages;
+            const minDiscount = readNumberInput('discount-input', 0);
+            const cards = data.items
+                .filter(item => {
+                    const discount = this.getItemDiscount(item);
+                    return minDiscount <= 0 || (discount !== null && discount >= minDiscount);
+                })
+                .map(item => this.makeCard(item))
+                .filter(Boolean);
+            return { page: pageNumber, cards };
+        }
+    };
+
+    /*************************************************************************
+     * Adapter: Skinport
+     *************************************************************************/
+
+    const SkinportAdapter = {
+        id: 'skinport',
+        reloadInitialPage: true,
+        pageLimit: 50,
+        cardTemplate: null,
+        gridElement: null,
+        marketNamesByClassId: new Map(),
+        marketNamesBySlug: new Map(),
+        matches: () => ['skinport.com', 'www.skinport.com'].includes(window.location.hostname)
+            && /(?:^|\/)market(?:\/|$)/i.test(window.location.pathname),
+        getAppId() {
+            const pathMatch = window.location.pathname.match(/\/market\/(\d+)/i);
+            const pathAppId = parseInt(pathMatch?.[1], 10);
+            return Number.isFinite(pathAppId) && pathAppId > 0 ? pathAppId : detectAppId(730);
+        },
+        getPageRequestDelayMs() {
+            const seconds = Math.max(0, Math.min(10, readNumberInput('skinport-delay-input', 1)));
+            return seconds * 1000;
+        },
+        getStyles() {
+            return `
+                .skinport-native-profit-card {
+                    position: relative !important;
+                }
+                .skinport-native-profit-card .steam-highest-buy-order-link[data-profit-helper-badge="true"] {
+                    top: 10px !important;
+                    left: 10px !important;
+                    right: 10px !important;
+                    width: auto !important;
+                    min-height: 0 !important;
+                    margin: 0 !important;
+                }
+            `;
+        },
+        findNativeGrid(root = document) {
+            const links = Array.from(root.querySelectorAll?.('a[href*="/item/"]') || []);
+            const candidates = new Map();
+
+            links.forEach(link => {
+                for (let node = link.parentElement, depth = 0; node && depth < 7; node = node.parentElement, depth++) {
+                    if (node === document.body || node.tagName === 'MAIN') break;
+                    const directCards = Array.from(node.children)
+                        .filter(child => child.querySelector?.('a[href*="/item/"]')).length;
+                    if (directCards >= 2) {
+                        candidates.set(node, Math.max(candidates.get(node) || 0, directCards));
+                        break;
+                    }
+                }
+            });
+
+            return Array.from(candidates.entries())
+                .sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+        },
+        getGrid(root = document) {
+            if (root === document && this.gridElement?.isConnected) return this.gridElement;
+            const grid = this.findNativeGrid(root);
+            if (root === document && grid) this.gridElement = grid;
+            return grid;
+        },
+        getCards(root = document) {
+            const grid = this.getGrid(root);
+            if (!grid) return [];
+            return Array.from(grid.children)
+                .filter(card => card.classList?.contains('skinport-generated-card')
+                    || card.matches?.('a[href*="/item/"]')
+                    || card.querySelector?.('a[href*="/item/"]'))
+                .map(card => {
+                    card.classList.add('skinport-native-profit-card');
+                    return card;
+                });
+        },
+        ownsCard(card) {
+            return Boolean(card?.classList?.contains('skinport-native-profit-card'));
+        },
+        prepareReloadGrid(grid) {
+            const template = this.getCards().find(card => !card.classList.contains('skinport-generated-card'));
+            if (template) {
+                this.cardTemplate = template.cloneNode(true);
+                this.resetGeneratedCard(this.cardTemplate);
+            }
+            this.gridElement = grid;
+            return grid;
+        },
+        resetGeneratedCard(card) {
+            card.classList.add('skinport-native-profit-card', 'skinport-generated-card');
+            card.querySelectorAll('.steam-highest-buy-order-link[data-profit-helper-badge="true"]').forEach(badge => badge.remove());
+            [
+                ATTRIBUTE.processed,
+                ATTRIBUTE.filtered,
+                ATTRIBUTE.profit,
+                ATTRIBUTE.profitPercent,
+                ATTRIBUTE.result,
+                ATTRIBUTE.queued,
+                ATTRIBUTE.marketHashName,
+                ATTRIBUTE.price,
+                ATTRIBUTE.discount,
+                'data-skinport-classid',
+                'data-skinport-slug'
+            ].forEach(attribute => card.removeAttribute(attribute));
+            card.style.removeProperty('z-index');
+        },
+        rememberMarketName(map, key, marketHashName) {
+            const normalizedKey = normalizeText(key);
+            const normalizedName = normalizeText(marketHashName);
+            if (!normalizedKey || !normalizedName) return;
+
+            if (!map.has(normalizedKey)) map.set(normalizedKey, normalizedName);
+            else if (map.get(normalizedKey) !== normalizedName) map.set(normalizedKey, null);
+
+            while (map.size > CONFIG.maxSteamCacheEntries) map.delete(map.keys().next().value);
+        },
+        rememberItems(items) {
+            items.forEach(item => {
+                const appId = String(item.appid || this.getAppId());
+                this.rememberMarketName(this.marketNamesByClassId, `${appId}:${item.classid || ''}`, item.marketHashName);
+                this.rememberMarketName(this.marketNamesBySlug, `${appId}:${item.url || ''}`, item.marketHashName);
+            });
+        },
+        getClassId(card) {
+            const storedClassId = normalizeText(card.getAttribute('data-skinport-classid'));
+            if (storedClassId) return storedClassId;
+
+            const imageUrl = card.querySelector?.('.ItemPreview-itemImage img, img')?.getAttribute('src') || '';
+            return imageUrl.match(/\/economy\/image\/class\/\d+\/(\d+)/i)?.[1] || '';
+        },
+        getSlug(card) {
+            const storedSlug = normalizeText(card.getAttribute('data-skinport-slug'));
+            if (storedSlug) return storedSlug;
+
+            const href = card.querySelector?.('.ItemPreview-link[href*="/item/"], .ItemPreview-href[href*="/item/"], a[href*="/item/"]')?.getAttribute('href') || '';
+            try {
+                return decodeURIComponent(new URL(href, window.location.origin).pathname.match(/\/item\/([^/?#]+)/i)?.[1] || '');
+            } catch (_) {
+                return '';
+            }
+        },
+        getSteamMarketHashName(card) {
+            const storedName = normalizeText(card.getAttribute(ATTRIBUTE.marketHashName));
+            if (storedName) return storedName;
+
+            const appId = String(this.getAppId());
+            const byClassId = this.marketNamesByClassId.get(`${appId}:${this.getClassId(card)}`);
+            if (byClassId) return byClassId;
+            return this.marketNamesBySlug.get(`${appId}:${this.getSlug(card)}`) || '';
+        },
+        getName(card) {
+            const storedName = normalizeText(card.getAttribute(ATTRIBUTE.marketHashName));
+            if (storedName) return storedName;
+
+            const skinportName = normalizeText(card.querySelector('.ItemPreview-href')?.getAttribute('aria-label')
+                || card.querySelector('.ItemPreview-itemName')?.textContent);
+            if (skinportName) return skinportName;
+
+            const link = card.matches?.('a[href*="/item/"]')
+                ? card
+                : card.querySelector('a[href*="/item/"]');
+            const candidates = [
+                card.querySelector?.('[data-market-hash-name]')?.getAttribute('data-market-hash-name'),
+                firstText(card, ['[class*="name" i]', '[class*="title" i]']),
+                link?.getAttribute('title'),
+                link?.getAttribute('aria-label'),
+                card.querySelector?.('img[alt]')?.getAttribute('alt')
+            ];
+            return candidates
+                .map(normalizeText)
+                .find(value => value.length >= 2 && !/[₽$€£¥%]|руб\.?|USD|EUR/i.test(value)) || '';
+        },
+        getPrice(card) {
+            const storedPrice = parsePrice(card.getAttribute(ATTRIBUTE.price));
+            if (isValidPrice(storedPrice)) return storedPrice;
+
+            const skinportPrice = parsePrice(card.querySelector('.ItemPreview-priceValue .Tooltip-link')?.textContent
+                || card.querySelector('.ItemPreview-priceValue')?.textContent);
+            if (isValidPrice(skinportPrice)) return skinportPrice;
+
+            const elements = Array.from(card.querySelectorAll?.('[class*="price" i], [class*="amount" i], [data-price], span, div') || [])
+                .filter(element => !element.closest('.steam-highest-buy-order-link[data-profit-helper-badge="true"]')
+                    && !element.querySelector?.('.steam-highest-buy-order-link[data-profit-helper-badge="true"]'));
+            const candidates = elements.map(element => {
+                const directText = getDirectText(element);
+                const fullText = normalizeText(element.textContent);
+                const currencyMatch = fullText.match(/\d[\d\s.,]*\s*(?:₽|руб\.?|RUB|[$€£¥₴₸₹])/i);
+                const ownText = normalizeText(currencyMatch?.[0]
+                    || directText
+                    || (element.children.length === 0 ? element.textContent : ''));
+                const attributePrice = normalizeText(element.getAttribute('data-price'));
+                const text = ownText || attributePrice;
+                const marker = `${element.className || ''} ${element.getAttribute('data-testid') || ''} ${text}`;
+                const isPriceElement = element.matches('[class*="price" i], [class*="amount" i], [data-price]');
+                return {
+                    text,
+                    value: parsePrice(text),
+                    hasCurrency: /[₽$€£¥₴₸₹]|руб\.?|RUB|USD|EUR/i.test(text),
+                    isReference: /reference|referent|референт|suggested|recommended|рекомендован/i.test(marker),
+                    isPriceElement
+                };
+            }).filter(candidate => isValidPrice(candidate.value)
+                && !/%/.test(candidate.text)
+                && (candidate.hasCurrency || candidate.isPriceElement));
+
+            const visiblePrices = candidates
+                .filter(candidate => candidate.hasCurrency && !candidate.isReference)
+                .map(candidate => candidate.value);
+            if (visiblePrices.length) return Math.min(...visiblePrices);
+
+            const fallbackPrices = candidates
+                .filter(candidate => !candidate.isReference)
+                .map(candidate => candidate.value);
+            return fallbackPrices.length ? Math.min(...fallbackPrices) : NaN;
+        },
+        getDiscount(card) {
+            return parseDiscountPercent(card.getAttribute(ATTRIBUTE.discount)
+                || card.querySelector('.ItemPreview-discount')?.textContent
+                || card.textContent);
+        },
+        getItemPrice(item) {
+            const price = Number(item?.salePrice) / 100;
+            return isValidPrice(price) ? price : NaN;
+        },
+        getItemReferencePrice(item) {
+            const price = Number(item?.referencePrice) / 100;
+            return isValidPrice(price) ? price : NaN;
+        },
+        getItemDiscount(item) {
+            const salePrice = this.getItemPrice(item);
+            const referencePrice = this.getItemReferencePrice(item);
+            if (!isValidPrice(salePrice) || !isValidPrice(referencePrice) || salePrice >= referencePrice) return null;
+            return Math.round(((referencePrice - salePrice) / referencePrice) * 100);
+        },
+        formatItemPrice(price, currency = 'RUB') {
+            return new Intl.NumberFormat('ru-RU', {
+                style: 'currency',
+                currency: currency || 'RUB',
+                minimumFractionDigits: 0,
+                maximumFractionDigits: 0
+            }).format(price);
+        },
+        getItemHref(slug) {
+            const templateHref = this.cardTemplate?.querySelector('.ItemPreview-link[href*="/item/"], .ItemPreview-href[href*="/item/"]')?.getAttribute('href') || '';
+            if (templateHref) return templateHref.replace(/(\/item\/)[^/?#]+/i, `$1${encodeURIComponent(slug)}`);
+
+            const segments = window.location.pathname.split('/').filter(Boolean);
+            const marketIndex = segments.indexOf('market');
+            const prefix = marketIndex >= 0 ? segments.slice(0, marketIndex).join('/') : '';
+            return `/${prefix ? `${prefix}/` : ''}item/${encodeURIComponent(slug)}`;
+        },
+        makeCard(item) {
+            const marketHashName = normalizeText(item?.marketHashName);
+            const slug = normalizeText(item?.url);
+            const price = this.getItemPrice(item);
+            if (!this.cardTemplate || !marketHashName || !slug || !isValidPrice(price)) return null;
+
+            const card = this.cardTemplate.cloneNode(true);
+            this.resetGeneratedCard(card);
+
+            const discount = this.getItemDiscount(item);
+            const displayName = normalizeText(item.name || item.marketName || marketHashName);
+            const itemHref = this.getItemHref(slug);
+            card.setAttribute(ATTRIBUTE.marketHashName, marketHashName);
+            card.setAttribute(ATTRIBUTE.price, String(price));
+            card.setAttribute('data-skinport-classid', normalizeText(item.classid));
+            card.setAttribute('data-skinport-slug', slug);
+            if (discount !== null) card.setAttribute(ATTRIBUTE.discount, `-${discount}%`);
+
+            const hrefLink = card.querySelector('.ItemPreview-href');
+            if (hrefLink) {
+                hrefLink.href = itemHref;
+                hrefLink.textContent = displayName;
+                hrefLink.setAttribute('aria-label', displayName);
+            }
+            card.querySelectorAll('.ItemPreview-link').forEach(link => { link.href = itemHref; });
+
+            const image = card.querySelector('.ItemPreview-itemImage img');
+            if (image) {
+                image.src = item.image
+                    ? `https://community.steamstatic.com/economy/image/${String(item.image).replace(/^\/+/, '')}/256x128`
+                    : `https://community.steamstatic.com/economy/image/class/${item.appid || this.getAppId()}/${item.classid}/256x128`;
+                image.removeAttribute('srcset');
+                image.alt = displayName;
+            }
+
+            const priceElement = card.querySelector('.ItemPreview-priceValue .Tooltip-link');
+            if (priceElement) priceElement.textContent = this.formatItemPrice(price, item.currency);
+
+            const oldPriceElement = card.querySelector('.ItemPreview-oldPrice');
+            const referencePrice = this.getItemReferencePrice(item);
+            if (oldPriceElement) {
+                oldPriceElement.textContent = isValidPrice(referencePrice)
+                    ? `Референтная цена ${this.formatItemPrice(referencePrice, item.currency)}`
+                    : '';
+            }
+
+            const discountElement = card.querySelector('.ItemPreview-discount');
+            if (discountElement) {
+                discountElement.style.display = discount !== null ? '' : 'none';
+                const valueElement = discountElement.querySelector('span') || discountElement;
+                valueElement.textContent = discount !== null ? `− ${discount}%` : '';
+            }
+
+            const titleElement = card.querySelector('.ItemPreview-itemTitle');
+            if (titleElement) {
+                titleElement.textContent = normalizeText(item.title || item.category);
+                if (item.color) titleElement.style.color = item.color;
+            }
+            const nameElement = card.querySelector('.ItemPreview-itemName');
+            if (nameElement) nameElement.textContent = displayName;
+            const textElement = card.querySelector('.ItemPreview-itemText');
+            if (textElement) textElement.textContent = normalizeText(item.text || item.type);
+
+            const mainAction = card.querySelector('.ItemPreview-mainAction');
+            if (mainAction) {
+                mainAction.textContent = 'Открыть предмет';
+                mainAction.addEventListener('click', () => window.location.assign(itemHref));
+            }
+            card.querySelectorAll('.ItemPreview-sideAction').forEach(button => { button.style.display = 'none'; });
+            return card;
+        },
+        buildBrowseUrl(pageNumber, context = {}) {
+            const url = new URL(`/api/browse/${this.getAppId()}`, window.location.origin);
+            const searchParams = context.searchParams || new URLSearchParams(window.location.search);
+            searchParams.forEach((value, key) => {
+                if (key !== 'skip') url.searchParams.append(key, value);
+            });
+            const skip = Math.max(0, pageNumber - 1);
+            if (skip > 0) url.searchParams.set('skip', String(skip));
+            return url.toString();
+        },
+        async loadPage(pageNumber, context) {
+            const data = await fetchJson(this.buildBrowseUrl(pageNumber, context), {
+                signal: context.signal,
+                credentials: 'include'
+            });
+            const items = Array.isArray(data?.items) ? data.items : [];
+            this.rememberItems(items);
+
+            const minDiscount = readNumberInput('discount-input', 0);
+            const cards = items
+                .filter(item => {
+                    const discount = this.getItemDiscount(item);
+                    return minDiscount <= 0 || (discount !== null && discount >= minDiscount);
+                })
+                .map(item => this.makeCard(item))
+                .filter(Boolean);
+            return { page: pageNumber, cards, itemsCount: items.length };
+        }
+    };
+
+    /*************************************************************************
      * Adapter: Steam-Trader
      *************************************************************************/
 
@@ -2035,7 +3109,7 @@
         }
     };
 
-    const ADAPTERS = [TradeitAdapter, KeysStoreAdapter, SteamTraderAdapter, AvanAdapter, LisAdapter];
+    const ADAPTERS = [TradeitAdapter, SkinportAdapter, WaxpeerAdapter, MoonMarketAdapter, KeysStoreAdapter, SteamTraderAdapter, AvanAdapter, LisAdapter];
 
     /*************************************************************************
      * Main workflow
@@ -2381,7 +3455,9 @@
 
         const cardAdapter = getCardAdapter(card, adapter);
         const name = cardAdapter.getName(card);
-        const steamMarketHashName = cardAdapter.getSteamMarketHashName?.(card) || name;
+        const steamMarketHashName = cardAdapter.getSteamMarketHashName
+            ? cardAdapter.getSteamMarketHashName(card)
+            : name;
         const sitePrice = cardAdapter.getPrice(card);
         const appId = cardAdapter.getAppId();
         const badge = createBadge(card, cardAdapter);
@@ -2512,6 +3588,10 @@
                     operation.siteLoaded++;
                     updateStatus(operation);
                 }
+
+                if (nextPage <= pagesCount + 1 && isOperationActive(operation) && !operation.stopLoadingRequested) {
+                    await waitForOperationDelay(operation, adapter.getPageRequestDelayMs?.() || 0);
+                }
             }
         };
 
@@ -2523,6 +3603,7 @@
         if (!adapter.reloadInitialPage) return;
 
         let grid = adapter.getGrid();
+        if (!grid && adapter.createGrid) grid = adapter.createGrid();
         if (!grid) return;
         grid = adapter.prepareReloadGrid?.(grid) || grid;
 
@@ -2606,7 +3687,9 @@
             await reloadInitialPage(operation, adapter);
             if (!isOperationActive(operation)) return;
 
-            const pagesCount = Math.max(0, Math.min(999, readNumberInput('pages-input', 0)));
+            const pagesCount = adapter.supportsPagination === false
+                ? 0
+                : Math.max(0, Math.min(999, readNumberInput('pages-input', 0)));
             await loadExtraPages(operation, adapter, pagesCount);
             if (!isOperationActive(operation)) return;
 
@@ -2646,7 +3729,19 @@
      * Boot
      *************************************************************************/
 
-    const observer = new MutationObserver(() => injectPanel());
-    observer.observe(document.documentElement, { childList: true, subtree: true });
-    injectPanel();
+    function boot() {
+        if (!document.documentElement) {
+            setTimeout(boot, 0);
+            return;
+        }
+
+        const observer = new MutationObserver(() => injectPanel());
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+        document.addEventListener('DOMContentLoaded', injectPanel, { once: true });
+        window.addEventListener('load', injectPanel, { once: true });
+        setInterval(injectPanel, 1500);
+        injectPanel();
+    }
+
+    boot();
 })();
