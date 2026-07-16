@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         lis-skins-profit-calculator
 // @namespace    http://tampermonkey.net
-// @version      19.3
+// @version      19.5
 // @description  lis-skins-profit-calculator
 // @author       p0pye + AI Helper
 // @match        https://lis-skins.com/*/market/*
@@ -73,6 +73,27 @@
     };
 
     const STEAM_IMAGE_BASE_URL = 'https://steamcommunity-a.akamaihd.net/economy/image/';
+    const CS2_ITEM_MODELS = new Map([
+        ['AK-47'], ['AUG'], ['AWP'], ['FAMAS'], ['G3SG1'], ['Galil AR'], ['M4A1-S'], ['M4A4'],
+        ['SCAR-20'], ['SG 553'], ['SSG 08'], ['CZ75-Auto'], ['Desert Eagle'], ['Dual Berettas'],
+        ['Five-SeveN'], ['Glock-18'], ['P2000'], ['P250'], ['R8 Revolver'], ['Tec-9'], ['USP-S'],
+        ['MAC-10'], ['MP5-SD'], ['MP7'], ['MP9'], ['P90'], ['PP-Bizon'], ['UMP-45'], ['MAG-7'],
+        ['Nova'], ['Sawed-Off'], ['XM1014'], ['M249'], ['Negev'], ['Zeus x27'],
+        ['Bayonet', '★ Bayonet'], ['Bowie Knife', '★ Bowie Knife'],
+        ['Butterfly Knife', '★ Butterfly Knife'], ['Classic Knife', '★ Classic Knife'],
+        ['Falchion Knife', '★ Falchion Knife'], ['Flip Knife', '★ Flip Knife'],
+        ['Gut Knife', '★ Gut Knife'], ['Huntsman Knife', '★ Huntsman Knife'],
+        ['Karambit', '★ Karambit'], ['Kukri Knife', '★ Kukri Knife'],
+        ['M9 Bayonet', '★ M9 Bayonet'], ['Navaja Knife', '★ Navaja Knife'],
+        ['Nomad Knife', '★ Nomad Knife'], ['Paracord Knife', '★ Paracord Knife'],
+        ['Shadow Daggers', '★ Shadow Daggers'], ['Skeleton Knife', '★ Skeleton Knife'],
+        ['Stiletto Knife', '★ Stiletto Knife'], ['Survival Knife', '★ Survival Knife'],
+        ['Talon Knife', '★ Talon Knife'], ['Ursus Knife', '★ Ursus Knife'],
+        ['Bloodhound Gloves', '★ Bloodhound Gloves'], ['Broken Fang Gloves', '★ Broken Fang Gloves'],
+        ['Driver Gloves', '★ Driver Gloves'], ['Hand Wraps', '★ Hand Wraps'],
+        ['Hydra Gloves', '★ Hydra Gloves'], ['Moto Gloves', '★ Moto Gloves'],
+        ['Specialist Gloves', '★ Specialist Gloves'], ['Sport Gloves', '★ Sport Gloves']
+    ].map(([source, canonical = source]) => [source.toLowerCase(), canonical]));
     const ATTRIBUTE = {
         processed: 'data-profit-helper-processed',
         filtered: 'data-profit-helper-filtered',
@@ -1129,7 +1150,14 @@
                 BS: 'Battle-Scarred'
             };
             const shortWearMatch = cardText.match(/(?:^|[\s/|])(?:FN|MW|FT|WW|BS)(?=$|[\s/|])/i);
-            return shortWearMatch ? wearAliases[shortWearMatch[0].replace(/[\s/|]/g, '').toUpperCase()] || '' : '';
+            if (shortWearMatch) {
+                return wearAliases[shortWearMatch[0].replace(/[\s/|]/g, '').toUpperCase()] || '';
+            }
+
+            const elementWear = Array.from(card.querySelectorAll('*'))
+                .map(element => normalizeText(getDirectText(element)).toUpperCase())
+                .find(value => wearAliases[value]);
+            return elementWear ? wearAliases[elementWear] : '';
         },
         getCsExteriorCategoryValue(exteriorText) {
             const exteriorCategories = {
@@ -1173,20 +1201,94 @@
                 || nestedCandidates.sort((a, b) => b.length - a.length)[0]
                 || this.getName(card);
         },
+        getCsCardTextValues(card) {
+            const values = [];
+            const addValue = value => {
+                const normalized = normalizeText(value);
+                if (normalized) values.push(normalized);
+            };
+
+            [card, ...Array.from(card.querySelectorAll('*'))].forEach(element => {
+                addValue(getDirectText(element));
+                ['data-weapon', 'data-type', 'data-title', 'title', 'aria-label']
+                    .forEach(attribute => addValue(element.getAttribute?.(attribute)));
+            });
+            return Array.from(new Set(values));
+        },
+        getCsItemModel(card) {
+            const values = this.getCsCardTextValues(card);
+
+            for (const value of values) {
+                const cleanValue = value
+                    .replace(/^★\s*/, '')
+                    .replace(/^(?:ST™?|StatTrak™?|SV|Souvenir)\s+/i, '');
+                const model = CS2_ITEM_MODELS.get(cleanValue.toLowerCase());
+                if (model) return model;
+            }
+            return '';
+        },
+        getCsMarketType(card) {
+            const typePattern = /^(Sticker|Patch|Charm|Music Kit|Sealed Graffiti|Graffiti)(?:\s*\|\s*(.+))?$/i;
+            for (const value of this.getCsCardTextValues(card)) {
+                const match = value.match(typePattern);
+                if (!match) continue;
+
+                const canonicalTypes = {
+                    sticker: 'Sticker',
+                    patch: 'Patch',
+                    charm: 'Charm',
+                    'music kit': 'Music Kit',
+                    'sealed graffiti': 'Sealed Graffiti',
+                    graffiti: 'Sealed Graffiti'
+                };
+                return {
+                    type: canonicalTypes[match[1].toLowerCase()],
+                    collection: normalizeText(match[2])
+                };
+            }
+            return null;
+        },
+        getCsItemQuality(card) {
+            const values = this.getCsCardTextValues(card);
+            if (values.some(value => /(?:^|\s)(?:ST™?|StatTrak™?)(?=\s|$)/i.test(value))) return 'stattrak';
+            if (values.some(value => /(?:^|\s)(?:SV|Souvenir)(?=\s|$)/i.test(value))) return 'souvenir';
+            return '';
+        },
+        composeCsMarketHashName(card, itemName) {
+            const normalizedName = normalizeText(itemName);
+            if (!normalizedName || normalizedName.includes('|')) return normalizedName;
+
+            const marketType = this.getCsMarketType(card);
+            if (marketType && normalizedName.toLowerCase() !== marketType.type.toLowerCase()) {
+                const collectionSuffix = marketType.collection ? ` | ${marketType.collection}` : '';
+                return `${marketType.type} | ${normalizedName}${collectionSuffix}`;
+            }
+
+            const itemModel = this.getCsItemModel(card);
+            if (!itemModel || normalizedName.replace(/^★\s*/, '').toLowerCase() === itemModel.replace(/^★\s*/, '').toLowerCase()) {
+                return normalizedName;
+            }
+            if (normalizedName.toLowerCase().startsWith(`${itemModel.toLowerCase()} `)) return normalizedName;
+
+            return `${itemModel} | ${normalizedName}`;
+        },
         getSteamMarketHashName(card) {
             const appId = this.getAppId();
             let itemName = this.getBestMarketHashName(card, appId);
             if (!itemName || appId !== 730) return this.normalizeSteamMarketHashName(itemName, appId);
+
+            itemName = this.composeCsMarketHashName(card, itemName);
 
             const cardText = normalizeText(card.textContent);
             const exteriorText = this.getCsExteriorText(card);
             const wearPattern = /\((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)$/i;
             const hasStatTrakPrefix = /^StatTrak™?\s+/i.test(itemName) || /^★\s+StatTrak™?\s+/i.test(itemName);
             const hasSouvenirPrefix = /^Souvenir\s+/i.test(itemName) || /^★\s+Souvenir\s+/i.test(itemName);
+            const itemQuality = this.getCsItemQuality(card);
 
-            if (/(?:^|[\s/|])ST™?(?=$|[\s/|])|StatTrak™?/i.test(cardText) && !hasStatTrakPrefix) {
+            if ((itemQuality === 'stattrak' || /StatTrak™?/i.test(cardText)) && !hasStatTrakPrefix) {
                 itemName = `StatTrak™ ${itemName}`;
-            } else if (/(?:^|[\s/|])Souvenir(?=$|[\s/|])/i.test(cardText) && !hasSouvenirPrefix) {
+            } else if ((itemQuality === 'souvenir' || /Souvenir/i.test(cardText)) && !hasSouvenirPrefix) {
                 itemName = `Souvenir ${itemName}`;
             }
 
