@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         lis-skins-profit-calculator
 // @namespace    http://tampermonkey.net
-// @version      19.5
+// @version      19.18
 // @description  lis-skins-profit-calculator
 // @author       p0pye + AI Helper
 // @match        https://lis-skins.com/*/market/*
@@ -50,7 +50,11 @@
         steamTimeoutMs: 8000,
         siteTimeoutMs: 20000,
         steamCacheTtlMs: 5 * 60 * 1000,
-        maxSteamCacheEntries: 3000,
+        maxSteamCacheEntries: 1000,
+        maxWorkLogEntries: 1000,
+        moonPriceValidationDiscountPercent: 70,
+        moonOfferCacheTtlMs: 60 * 1000,
+        maxMoonOfferCacheEntries: 1000,
         intermediateSteamThreshold: 1000,
         intermediateSortEvery: 50,
         colors: {
@@ -120,6 +124,7 @@
     let steamQueueRunning = false;
     let tooltipHideTimer = null;
     const steamCache = new Map();
+    const workLogEntries = [];
 
     function createOperation() {
         currentOperation = {
@@ -146,10 +151,18 @@
     function finishOperation(operation, text = 'Готово!') {
         if (currentOperation !== operation) return;
 
+        logWork('INFO', text, {
+            operation: operation.id,
+            duration: formatDuration(Date.now() - operation.startedAt),
+            pages: `${operation.siteLoaded}/${operation.siteTotal}`,
+            steam: `${operation.steamDone}/${operation.steamTotal}`
+        });
         currentOperation = null;
         steamQueue = [];
         operation.pendingDetachedCards = [];
         steamQueueRunning = false;
+        restoreAllParkedImages();
+        steamCache.clear();
         setStartButtonLoading(false);
         setStatus(text);
         updateRetryErrorsButton();
@@ -161,6 +174,7 @@
 
         if (operation.siteTotal > operation.siteLoaded && !operation.stopLoadingRequested) {
             operation.stopLoadingRequested = true;
+            logWork('WARN', 'Запрошена остановка загрузки страниц', { operation: operation.id });
             operation.cleanups.forEach(cleanup => {
                 try { cleanup(); } catch (e) {}
             });
@@ -169,6 +183,7 @@
         }
 
         operation.cancelled = true;
+        logWork('WARN', 'Операция отменена пользователем', { operation: operation.id });
         operation.cleanups.forEach(cleanup => {
             try { cleanup(); } catch (e) {}
         });
@@ -308,6 +323,33 @@
         return new DOMParser().parseFromString(await response.text(), 'text/html');
     }
 
+    function makeHtmlLightweight(html) {
+        const withoutHeavyElements = String(html || '')
+            .replace(/<(script|style|iframe|noscript)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '')
+            .replace(/<link\b[^>]*rel\s*=\s*["']?stylesheet["']?[^>]*>/gi, '');
+        const parkedAttributes = {
+            src: 'data-profit-original-src',
+            srcset: 'data-profit-original-srcset',
+            'data-src': 'data-profit-original-data-src',
+            'data-lazy-src': 'data-profit-original-data-lazy-src'
+        };
+
+        return withoutHeavyElements.replace(/<img\b[^>]*>/gi, tag => tag.replace(
+            /\s(src|srcset|data-src|data-lazy-src)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi,
+            (attribute, name, value) => ` ${parkedAttributes[name.toLowerCase()]}=${value}`
+        ));
+    }
+
+    async function fetchInertHtmlFragment(url, { signal } = {}) {
+        const response = await fetch(url, {
+            signal,
+            credentials: 'include',
+            headers: { Accept: 'text/html,application/xhtml+xml' }
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return new DOMParser().parseFromString(makeHtmlLightweight(await response.text()), 'text/html');
+    }
+
     function gmRequestJson(url, { timeout = CONFIG.steamTimeoutMs } = {}) {
         return new Promise((resolve, reject) => {
             if (typeof GM_xmlhttpRequest !== 'function') {
@@ -380,7 +422,7 @@
         if (!Array.isArray(compactOrders)) return [];
 
         const rows = [];
-        for (let index = 0; index + 1 < compactOrders.length; index += 2) {
+        for (let index = 0; index + 1 < compactOrders.length && rows.length < 20; index += 2) {
             const salePrice = Number(compactOrders[index]) / 100;
             const ordersCount = String(compactOrders[index + 1] ?? '').replace(/\s| /g, '');
             if (!isValidPrice(salePrice) || !ordersCount) continue;
@@ -390,9 +432,10 @@
         return rows;
     }
 
-    async function fetchSteamBestBuyOrder(appId, marketHashName) {
+    async function fetchSteamBestBuyOrder(appId, marketHashName, { forceRefresh = false } = {}) {
         pruneSteamCache();
         const cacheKey = `${appId}:${marketHashName}`;
+        if (forceRefresh) steamCache.delete(cacheKey);
         const cached = steamCache.get(cacheKey);
         if (cached) return cached;
 
@@ -442,12 +485,51 @@
      * UI
      *************************************************************************/
 
+    function formatWorkLogDetails(details) {
+        if (details === null || details === undefined || details === '') return '';
+        if (typeof details === 'string') return details;
+
+        try {
+            return Object.entries(details)
+                .filter(([, value]) => value !== null && value !== undefined && value !== '')
+                .map(([key, value]) => `${key}=${typeof value === 'object' ? JSON.stringify(value) : value}`)
+                .join('; ');
+        } catch (_) {
+            return String(details);
+        }
+    }
+
+    function renderWorkLog() {
+        const output = document.getElementById('profit-helper-work-log');
+        const panel = document.getElementById('profit-helper-panel');
+        if (!output || panel?.dataset.logOpen !== 'true') return;
+
+        output.value = workLogEntries.join('\n');
+        output.scrollTop = output.scrollHeight;
+    }
+
+    function logWork(level, message, details = null) {
+        const time = new Date().toLocaleTimeString('ru-RU', { hour12: false });
+        const detailsText = formatWorkLogDetails(details);
+        workLogEntries.push(`[${time}] [${level}] ${message}${detailsText ? ` | ${detailsText}` : ''}`);
+        if (workLogEntries.length > CONFIG.maxWorkLogEntries) {
+            workLogEntries.splice(0, workLogEntries.length - CONFIG.maxWorkLogEntries);
+        }
+        renderWorkLog();
+    }
+
+    function clearWorkLog() {
+        workLogEntries.length = 0;
+        logWork('INFO', 'Лог очищен');
+    }
+
     function setStatus(text) {
         const status = document.getElementById('combine-status');
         if (status) status.innerText = text || '';
     }
 
     function showToast(message, kind = 'success') {
+        if (kind === 'error') logWork('ERROR', message);
         let container = document.getElementById('profit-helper-toast-container');
         if (!container) {
             container = document.createElement('div');
@@ -586,6 +668,147 @@
         `;
     }
 
+    function getPanelPositionStorageKey() {
+        return `profit_helper_panel_position_${window.location.hostname}`;
+    }
+
+    function getLogWidthStorageKey() {
+        return `profit_helper_log_width_${window.location.hostname}`;
+    }
+
+    function clampLogWidth(value) {
+        const maxWidth = Math.max(300, window.innerWidth - 236);
+        return Math.min(maxWidth, Math.max(300, Number.isFinite(value) ? value : 532));
+    }
+
+    function setLogWidth(panel, width, save = false) {
+        const normalizedWidth = Math.round(clampLogWidth(width));
+        panel.style.setProperty('--profit-log-width', `${normalizedWidth}px`);
+        if (save) localStorage.setItem(getLogWidthStorageKey(), String(normalizedWidth));
+        return normalizedWidth;
+    }
+
+    function restoreLogWidth(panel) {
+        setLogWidth(panel, parseFloat(localStorage.getItem(getLogWidthStorageKey())));
+    }
+
+    function clampPanelPosition(panel, left, top) {
+        const rect = panel.getBoundingClientRect();
+        const maxLeft = Math.max(0, window.innerWidth - rect.width);
+        const maxTop = Math.max(0, window.innerHeight - Math.min(rect.height, window.innerHeight));
+        return {
+            left: Math.min(maxLeft, Math.max(0, Number.isFinite(left) ? left : rect.left)),
+            top: Math.min(maxTop, Math.max(0, Number.isFinite(top) ? top : rect.top))
+        };
+    }
+
+    function setPanelPosition(panel, left, top, save = false) {
+        const position = clampPanelPosition(panel, left, top);
+        panel.style.left = `${Math.round(position.left)}px`;
+        panel.style.top = `${Math.round(position.top)}px`;
+        panel.style.right = 'auto';
+        if (save) localStorage.setItem(getPanelPositionStorageKey(), JSON.stringify(position));
+    }
+
+    function restorePanelPosition(panel) {
+        try {
+            const saved = JSON.parse(localStorage.getItem(getPanelPositionStorageKey()) || 'null');
+            if (Number.isFinite(saved?.left) && Number.isFinite(saved?.top)) {
+                setPanelPosition(panel, saved.left, saved.top);
+                return;
+            }
+        } catch (_) {}
+        setPanelPosition(panel, 8, 140);
+    }
+
+    function bindPanelDragging(panel, onTitleClick) {
+        const handle = panel.querySelector('.profit-title');
+        if (!handle) return;
+
+        let drag = null;
+        handle.addEventListener('pointerdown', event => {
+            if (event.button !== 0) return;
+            const rect = panel.getBoundingClientRect();
+            drag = {
+                pointerId: event.pointerId,
+                startX: event.clientX,
+                startY: event.clientY,
+                left: rect.left,
+                top: rect.top,
+                moved: false
+            };
+            handle.setPointerCapture?.(event.pointerId);
+        });
+        handle.addEventListener('pointermove', event => {
+            if (!drag || drag.pointerId !== event.pointerId) return;
+            const deltaX = event.clientX - drag.startX;
+            const deltaY = event.clientY - drag.startY;
+            if (!drag.moved && Math.hypot(deltaX, deltaY) < 4) return;
+
+            drag.moved = true;
+            panel.dataset.dragging = 'true';
+            event.preventDefault();
+            setPanelPosition(panel, drag.left + deltaX, drag.top + deltaY);
+        });
+        const finishDrag = event => {
+            if (!drag || drag.pointerId !== event.pointerId) return;
+            const wasMoved = drag.moved;
+            drag = null;
+            panel.removeAttribute('data-dragging');
+            if (!wasMoved) return;
+
+            const rect = panel.getBoundingClientRect();
+            setPanelPosition(panel, rect.left, rect.top, true);
+            panel.dataset.justDragged = 'true';
+            setTimeout(() => panel.removeAttribute('data-just-dragged'), 0);
+        };
+        handle.addEventListener('pointerup', finishDrag);
+        handle.addEventListener('pointercancel', finishDrag);
+        handle.addEventListener('click', event => {
+            if (panel.dataset.justDragged === 'true') {
+                event.preventDefault();
+                event.stopPropagation();
+                return;
+            }
+            onTitleClick();
+        });
+    }
+
+    function bindLogResizing(panel) {
+        const handle = panel.querySelector('#profit-helper-log-resizer');
+        const logSection = panel.querySelector('#profit-helper-log-section');
+        if (!handle || !logSection) return;
+
+        let resize = null;
+        handle.addEventListener('pointerdown', event => {
+            if (event.button !== 0 || panel.dataset.logOpen !== 'true') return;
+            resize = {
+                pointerId: event.pointerId,
+                startX: event.clientX,
+                startWidth: logSection.getBoundingClientRect().width,
+                width: logSection.getBoundingClientRect().width
+            };
+            panel.dataset.logResizing = 'true';
+            handle.setPointerCapture?.(event.pointerId);
+            event.preventDefault();
+        });
+        handle.addEventListener('pointermove', event => {
+            if (!resize || resize.pointerId !== event.pointerId) return;
+            resize.width = setLogWidth(panel, resize.startWidth + event.clientX - resize.startX);
+            const rect = panel.getBoundingClientRect();
+            setPanelPosition(panel, rect.left, rect.top);
+            event.preventDefault();
+        });
+        const finishResize = event => {
+            if (!resize || resize.pointerId !== event.pointerId) return;
+            setLogWidth(panel, resize.width, true);
+            resize = null;
+            panel.removeAttribute('data-log-resizing');
+        };
+        handle.addEventListener('pointerup', finishResize);
+        handle.addEventListener('pointercancel', finishResize);
+    }
+
     function injectPanel() {
         const existingPanel = document.getElementById('profit-helper-panel');
         if (existingPanel?.isConnected) return;
@@ -608,19 +831,24 @@
             #profit-helper-panel {
                 position: fixed; top: 140px; left: 8px; z-index: 9999999;
                 width: 215px; padding: 12px; border-radius: 8px;
+                max-width: calc(100vw - 8px); max-height: calc(100vh - 8px); overflow: auto;
                 background: ${CONFIG.colors.panelBg}; color: ${CONFIG.colors.text};
                 border: 1px solid ${CONFIG.colors.panelBorder};
                 box-shadow: 0 4px 15px rgba(0,0,0,.8);
                 font: 13px Arial, "Helvetica Neue", sans-serif;
             }
+            #profit-helper-panel[data-log-open="true"]:not([data-collapsed="true"]) {
+                width: min(calc(var(--profit-log-width, 532px) + 228px), calc(100vw - 8px));
+            }
             #profit-helper-panel[data-collapsed="true"] {
-                left: 0; width: 28px; min-width: 28px; padding: 8px 3px;
+                width: 28px; min-width: 28px; padding: 8px 3px;
                 border-radius: 0 8px 8px 0; cursor: pointer;
             }
             .profit-title {
                 color: ${CONFIG.colors.panelAccent}; font-weight: bold; text-align: center; margin-bottom: 14px;
-                cursor: pointer; user-select: none;
+                cursor: grab; user-select: none; touch-action: none;
             }
+            #profit-helper-panel[data-dragging="true"] .profit-title { cursor: grabbing; }
             #profit-helper-panel[data-collapsed="true"] .profit-title {
                 writing-mode: vertical-rl; transform: rotate(180deg); margin: 0 auto;
                 white-space: nowrap; line-height: 1;
@@ -700,6 +928,49 @@
             #retry-errors-combine[data-visible="true"] {
                 display: flex !important;
             }
+            #toggle-work-log, #clear-work-log {
+                border: 1px solid ${CONFIG.colors.panelBorder} !important; border-radius: 4px !important;
+                color: ${CONFIG.colors.text} !important; background: ${CONFIG.colors.panelFieldBg} !important;
+                font-weight: bold !important; cursor: pointer !important;
+            }
+            #toggle-work-log {
+                width: 100% !important; min-height: 33px !important; margin-top: 8px !important; padding: 8px !important;
+            }
+            #profit-helper-log-section { display: none; min-width: 0; margin: 0; }
+            #profit-helper-panel[data-log-open="true"] #profit-helper-log-section { display: block; }
+            #profit-helper-panel[data-log-open="true"] .profit-panel-content {
+                display: grid; grid-template-columns: 190px minmax(300px, 1fr); gap: 14px; align-items: stretch;
+            }
+            .profit-controls-column { min-width: 0; }
+            #profit-helper-log-resizer {
+                display: none; position: absolute; top: 0; right: 0; bottom: 0; z-index: 5;
+                width: 8px; cursor: col-resize; touch-action: none;
+                background: transparent;
+                transition: background .15s ease;
+            }
+            #profit-helper-panel[data-log-open="true"] #profit-helper-log-resizer { display: block; }
+            #profit-helper-log-resizer:hover,
+            #profit-helper-panel[data-log-resizing="true"] #profit-helper-log-resizer {
+                background: color-mix(in srgb, ${CONFIG.colors.panelAccent} 55%, transparent);
+            }
+            .profit-helper-log-header {
+                display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px;
+                color: ${CONFIG.colors.panelStatus}; font-weight: bold;
+            }
+            #clear-work-log { padding: 5px 9px !important; font-size: 11px !important; }
+            #profit-helper-work-log {
+                display: block; width: 100%; height: 520px; min-height: 240px; resize: vertical;
+                padding: 9px; border: 1px solid ${CONFIG.colors.panelBorder}; border-radius: 4px;
+                background: #0b1220; color: #dbeafe; font: 11px/1.45 monospace;
+                white-space: pre; overflow: auto;
+            }
+            @media (max-width: 580px) {
+                #profit-helper-panel[data-log-open="true"] .profit-panel-content {
+                    grid-template-columns: minmax(0, 1fr);
+                }
+                #profit-helper-log-resizer { display: none !important; }
+                #profit-helper-work-log { height: 280px; }
+            }
             .profit-button-progress-bar {
                 position: absolute; top: 0; bottom: 0; left: 0; width: 0%;
                 background: ${CONFIG.colors.excellent}; transition: width .25s ease; pointer-events: none;
@@ -714,9 +985,32 @@
             }
             .steam-highest-buy-order-link[data-profit-helper-badge="true"] {
                 position: absolute; top: 32px; left: 10px; right: 10px; z-index: 30;
-                color: #fff !important; padding: 3px 8px; font: bold 11px Arial, sans-serif;
+                display: flex !important; align-items: stretch !important; padding: 0 !important;
+                color: #fff !important; font: bold 11px Arial, sans-serif;
                 border-radius: 4px; text-decoration: none !important; line-height: 1.25;
-                white-space: normal; overflow-wrap: anywhere; box-shadow: 0 2px 5px rgba(0,0,0,.3);
+                white-space: normal; overflow: hidden; box-shadow: 0 2px 5px rgba(0,0,0,.3);
+            }
+            .profit-helper-badge-link {
+                flex: 1 1 auto; min-width: 0; display: flex; align-items: center;
+                padding: 3px 6px; color: #fff !important; text-decoration: none !important;
+                overflow-wrap: anywhere;
+            }
+            .profit-helper-badge-refresh {
+                flex: 0 0 24px !important; width: 24px !important; min-width: 24px !important;
+                min-height: 22px !important; margin: 0 !important; padding: 0 !important;
+                display: inline-flex !important; align-items: center !important; justify-content: center !important;
+                border: 0 !important; border-left: 1px solid rgba(255,255,255,.3) !important;
+                border-radius: 0 !important; background: rgba(0,0,0,.16) !important;
+                color: #fff !important; cursor: pointer !important;
+            }
+            .profit-helper-badge-refresh:hover:not(:disabled) { background: rgba(255,255,255,.18) !important; }
+            .profit-helper-badge-refresh:disabled { cursor: wait !important; opacity: .7 !important; }
+            .profit-helper-badge-refresh svg {
+                width: 13px; height: 13px; display: block; fill: none; stroke: currentColor;
+                stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+            }
+            .steam-highest-buy-order-link[data-refreshing="true"] .profit-helper-badge-refresh svg {
+                animation: profit-spin 1s linear infinite;
             }
             ${getAdapterStyles()}
             .profit-helper-tooltip {
@@ -740,7 +1034,9 @@
             discount: localStorage.getItem('profit_helper_discount') || '0',
             pages: localStorage.getItem('profit_helper_pages') || '1',
             siteWorkers: localStorage.getItem('profit_helper_site_workers') || '4',
-            skinportDelay: localStorage.getItem('profit_helper_skinport_delay') || '1',
+            pageDelay: localStorage.getItem('profit_helper_page_delay')
+                || localStorage.getItem('profit_helper_skinport_delay')
+                || '1',
             steamWorkers: localStorage.getItem('profit_helper_steam_workers') || '3',
             minProfit: localStorage.getItem('profit_helper_min_profit') || '-100',
             tooltipRows: localStorage.getItem('profit_helper_tooltip_rows') || '3'
@@ -749,28 +1045,42 @@
         const panel = document.createElement('div');
         panel.id = 'profit-helper-panel';
         panel.dataset.collapsed = localStorage.getItem('profit_helper_panel_collapsed') === '1' ? 'true' : 'false';
+        panel.dataset.logOpen = 'false';
         panel.innerHTML = `
-            <div class="profit-title" title="Свернуть/развернуть панель">Profit-Calculator</div>
+            <div class="profit-title" title="Перетащить панель; нажать, чтобы свернуть">Profit-Calculator</div>
             <div class="profit-panel-content">
-                ${settingRow('Скидка, от %:', 'discount-input', saved.discount, 0, 100, CONFIG.colors.panelAccent, 'Минимальная скидка сайта.')}
-                ${settingRow('Страниц сайта:', 'pages-input', saved.pages, 0, 999, CONFIG.colors.panelSecondary, 'Сколько дополнительных страниц сайта загрузить.')}
-                ${settingRow('Потоков сайта:', 'site-workers-input', saved.siteWorkers, 1, 33, CONFIG.colors.neutral, 'Сколько страниц сайта грузить одновременно.')}
-                ${settingRow('Пауза страниц, сек:', 'skinport-delay-input', saved.skinportDelay, 0, 10, CONFIG.colors.neutral, 'Пауза между запросами страниц Skinport в одном потоке.')}
-                ${settingRow('Запросов Steam:', 'steam-workers-input', saved.steamWorkers, 1, 99, CONFIG.colors.panelSuccess, 'Сколько запросов Steam делать одновременно.')}
-                ${settingRow('Мин. выгода, от %:', 'min-profit-input', saved.minProfit, -100, 30, CONFIG.colors.negative, 'Скрывать карточки ниже этой выгоды после расчета.')}
-                ${settingRow('Строк в таблице:', 'tooltip-rows-input', saved.tooltipRows, 1, 20, CONFIG.colors.panelAccent, 'Сколько строк заявок показывать в таблице при наведении.')}
-                <button id="start-combine" type="button">Найти выгодные</button>
-                <button id="retry-errors-combine" type="button">Повторить обработку ошибочных</button>
-                <div id="combine-status"></div>
+                <div class="profit-controls-column">
+                    ${settingRow('Скидка, от %:', 'discount-input', saved.discount, 0, 100, CONFIG.colors.panelAccent, 'Минимальная скидка сайта.')}
+                    ${settingRow('Страниц сайта:', 'pages-input', saved.pages, 0, 999, CONFIG.colors.panelSecondary, 'Сколько дополнительных страниц сайта загрузить.')}
+                    ${settingRow('Потоков сайта:', 'site-workers-input', saved.siteWorkers, 1, 33, CONFIG.colors.neutral, 'Сколько страниц сайта грузить одновременно.')}
+                    ${settingRow('Пауза страниц, сек:', 'page-delay-input', saved.pageDelay, 0, 10, CONFIG.colors.neutral, 'Пауза между запросами страниц сайта в одном потоке.')}
+                    ${settingRow('Запросов Steam:', 'steam-workers-input', saved.steamWorkers, 1, 99, CONFIG.colors.panelSuccess, 'Сколько запросов Steam делать одновременно.')}
+                    ${settingRow('Мин. выгода, от %:', 'min-profit-input', saved.minProfit, -100, 30, CONFIG.colors.negative, 'Скрывать карточки ниже этой выгоды после расчета.')}
+                    ${settingRow('Строк в таблице:', 'tooltip-rows-input', saved.tooltipRows, 1, 20, CONFIG.colors.panelAccent, 'Сколько строк заявок показывать в таблице при наведении.')}
+                    <button id="start-combine" type="button">Найти выгодные</button>
+                    <button id="retry-errors-combine" type="button">Повторить обработку ошибочных</button>
+                    <button id="toggle-work-log" type="button">Лог работы</button>
+                    <div id="combine-status"></div>
+                </div>
+                <div id="profit-helper-log-resizer" title="Изменить ширину лога" aria-hidden="true"></div>
+                <div id="profit-helper-log-section">
+                    <div class="profit-helper-log-header">
+                        <span>Последние ${CONFIG.maxWorkLogEntries} записей</span>
+                        <button id="clear-work-log" type="button">Очистить</button>
+                    </div>
+                    <textarea id="profit-helper-work-log" readonly spellcheck="false" aria-label="Лог работы"></textarea>
+                </div>
             </div>
         `;
         document.body.appendChild(panel);
+        restoreLogWidth(panel);
+        restorePanelPosition(panel);
+        renderWorkLog();
 
         const adapter = getCurrentAdapter();
         const hiddenPaginationControls = adapter?.supportsPagination === false
-            ? ['pages-input', 'site-workers-input']
+            ? ['pages-input', 'site-workers-input', 'page-delay-input']
             : [];
-        if (adapter?.id !== 'skinport') hiddenPaginationControls.push('skinport-delay-input');
         hiddenPaginationControls.forEach(id => {
                 document.getElementById(id)?.closest('.profit-setting-row')?.style.setProperty('display', 'none');
                 document.getElementById(`${id}-range`)?.style.setProperty('display', 'none', 'important');
@@ -780,10 +1090,14 @@
             const collapsed = panel.dataset.collapsed !== 'true';
             panel.dataset.collapsed = collapsed ? 'true' : 'false';
             localStorage.setItem('profit_helper_panel_collapsed', collapsed ? '1' : '0');
+            requestAnimationFrame(() => restorePanelPosition(panel));
         };
-        panel.querySelector('.profit-title')?.addEventListener('click', toggleCollapsed);
+        bindPanelDragging(panel, toggleCollapsed);
+        bindLogResizing(panel);
         panel.addEventListener('click', event => {
-            if (panel.dataset.collapsed !== 'true' || event.target.closest('.profit-title')) return;
+            if (panel.dataset.collapsed !== 'true'
+                || panel.dataset.justDragged === 'true'
+                || event.target.closest('.profit-title')) return;
             toggleCollapsed();
         });
 
@@ -792,7 +1106,7 @@
             ['discount-input', 'profit_helper_discount'],
             ['pages-input', 'profit_helper_pages'],
             ['site-workers-input', 'profit_helper_site_workers'],
-            ['skinport-delay-input', 'profit_helper_skinport_delay'],
+            ['page-delay-input', 'profit_helper_page_delay'],
             ['steam-workers-input', 'profit_helper_steam_workers'],
             ['min-profit-input', 'profit_helper_min_profit'],
             ['tooltip-rows-input', 'profit_helper_tooltip_rows']
@@ -811,6 +1125,17 @@
 
         document.getElementById('start-combine')?.addEventListener('click', runSearch);
         document.getElementById('retry-errors-combine')?.addEventListener('click', runRetryErroredCards);
+        document.getElementById('toggle-work-log')?.addEventListener('click', () => {
+            const isOpen = panel.dataset.logOpen !== 'true';
+            panel.dataset.logOpen = isOpen ? 'true' : 'false';
+            document.getElementById('toggle-work-log').innerText = isOpen ? 'Скрыть лог' : 'Лог работы';
+            requestAnimationFrame(() => {
+                restorePanelPosition(panel);
+                if (isOpen) renderWorkLog();
+                else document.getElementById('profit-helper-work-log').value = '';
+            });
+        });
+        document.getElementById('clear-work-log')?.addEventListener('click', clearWorkLog);
         updateRetryErrorsButton();
     }
 
@@ -855,6 +1180,12 @@
         gridCache: new WeakMap(),
         cardsCache: new WeakMap(),
         linkCountCache: new WeakMap(),
+        nameCache: new WeakMap(),
+        nameElementCache: new WeakMap(),
+        priceCache: new WeakMap(),
+        discountCache: new WeakMap(),
+        csTextValuesCache: new WeakMap(),
+        csExteriorCache: new WeakMap(),
         cardTemplate: null,
         cardAttribute: 'data-profit-helper-lis-card',
         gridAttribute: 'data-profit-helper-lis-grid',
@@ -925,10 +1256,11 @@
             this.linkCountCache = new WeakMap();
         },
         onBadgeCreated(badge) {
-            badge.addEventListener('click', event => {
+            const link = badge.querySelector('.profit-helper-badge-link') || badge;
+            link.addEventListener('click', event => {
                 event.preventDefault();
                 event.stopPropagation();
-                if (badge.href) window.open(badge.href, '_blank', 'noopener');
+                if (link.href) window.open(link.href, '_blank', 'noopener');
             });
         },
         markCard(card) {
@@ -1087,6 +1419,8 @@
             return true;
         },
         getNameElement(card) {
+            if (this.nameElementCache.has(card)) return this.nameElementCache.get(card);
+
             const selectors = [
                 `[${ATTRIBUTE.marketHashName}]`,
                 '[data-market-hash-name]',
@@ -1100,21 +1434,32 @@
                 'span'
             ];
             const elements = uniqueElements(selectors.flatMap(selector => Array.from(card.querySelectorAll?.(selector) || [])));
-            return elements.find(element => this.isNameCandidate(element, this.getNameText(element))) || null;
+            const nameElement = elements.find(element => this.isNameCandidate(element, this.getNameText(element))) || null;
+            this.nameElementCache.set(card, nameElement);
+            return nameElement;
         },
         getName(card) {
             const storedName = this.cleanName(card.getAttribute(ATTRIBUTE.marketHashName));
             if (storedName) return storedName;
+            if (this.nameCache.has(card)) return this.nameCache.get(card);
 
             const link = this.getPrimaryItemLink(card);
             const linkName = this.cleanName(this.getNameAttribute(link));
-            if (linkName && this.isNameCandidate(link, linkName)) return linkName;
+            if (linkName && this.isNameCandidate(link, linkName)) {
+                this.nameCache.set(card, linkName);
+                return linkName;
+            }
 
             const nameElement = this.getNameElement(card);
             const elementName = this.getNameText(nameElement);
-            if (elementName) return elementName;
+            if (elementName) {
+                this.nameCache.set(card, elementName);
+                return elementName;
+            }
 
-            return this.cleanName(link?.querySelector('img')?.getAttribute('alt'));
+            const imageName = this.cleanName(link?.querySelector('img')?.getAttribute('alt'));
+            this.nameCache.set(card, imageName);
+            return imageName;
         },
         normalizeSteamMarketHashName(marketHashName, appId) {
             let normalized = normalizeText(marketHashName);
@@ -1138,9 +1483,14 @@
             return normalizeText(normalized);
         },
         getCsExteriorText(card) {
+            if (this.csExteriorCache.has(card)) return this.csExteriorCache.get(card);
+
             const cardText = normalizeText(card.textContent);
             const fullWearMatch = cardText.match(/\b(Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\b/i);
-            if (fullWearMatch) return fullWearMatch[1];
+            if (fullWearMatch) {
+                this.csExteriorCache.set(card, fullWearMatch[1]);
+                return fullWearMatch[1];
+            }
 
             const wearAliases = {
                 FN: 'Factory New',
@@ -1151,13 +1501,17 @@
             };
             const shortWearMatch = cardText.match(/(?:^|[\s/|])(?:FN|MW|FT|WW|BS)(?=$|[\s/|])/i);
             if (shortWearMatch) {
-                return wearAliases[shortWearMatch[0].replace(/[\s/|]/g, '').toUpperCase()] || '';
+                const exterior = wearAliases[shortWearMatch[0].replace(/[\s/|]/g, '').toUpperCase()] || '';
+                this.csExteriorCache.set(card, exterior);
+                return exterior;
             }
 
             const elementWear = Array.from(card.querySelectorAll('*'))
                 .map(element => normalizeText(getDirectText(element)).toUpperCase())
                 .find(value => wearAliases[value]);
-            return elementWear ? wearAliases[elementWear] : '';
+            const exterior = elementWear ? wearAliases[elementWear] : '';
+            this.csExteriorCache.set(card, exterior);
+            return exterior;
         },
         getCsExteriorCategoryValue(exteriorText) {
             const exteriorCategories = {
@@ -1202,6 +1556,9 @@
                 || this.getName(card);
         },
         getCsCardTextValues(card) {
+            const cached = this.csTextValuesCache.get(card);
+            if (cached) return cached;
+
             const values = [];
             const addValue = value => {
                 const normalized = normalizeText(value);
@@ -1213,7 +1570,9 @@
                 ['data-weapon', 'data-type', 'data-title', 'title', 'aria-label']
                     .forEach(attribute => addValue(element.getAttribute?.(attribute)));
             });
-            return Array.from(new Set(values));
+            const uniqueValues = Array.from(new Set(values));
+            this.csTextValuesCache.set(card, uniqueValues);
+            return uniqueValues;
         },
         getCsItemModel(card) {
             const values = this.getCsCardTextValues(card);
@@ -1314,29 +1673,53 @@
             return elements.find(element => isValidPrice(parsePrice(element.getAttribute?.(ATTRIBUTE.price) || getDirectText(element) || element.textContent))) || null;
         },
         getPrice(card) {
+            const storedPrice = parsePrice(card.getAttribute(ATTRIBUTE.price));
+            if (isValidPrice(storedPrice)) return storedPrice;
+            if (this.priceCache.has(card)) return this.priceCache.get(card);
+
             const exactPrice = parsePrice(firstText(card, ['[data-price]', '.price', '[class*="price" i]']));
-            if (isValidPrice(exactPrice)) return exactPrice;
+            if (isValidPrice(exactPrice)) {
+                this.priceCache.set(card, exactPrice);
+                return exactPrice;
+            }
 
             const text = normalizeText(card.textContent);
             const priceMatch = text.match(/(?:[$€₽₴₸]\s*)?\d[\d\s.,]*\s*(?:[$€₽₴₸]|USD|RUB|UAH|KZT|EUR)/i);
-            return parsePrice(priceMatch?.[0] || text);
+            const price = parsePrice(priceMatch?.[0] || text);
+            this.priceCache.set(card, price);
+            return price;
         },
         getDiscount(card) {
+            const storedDiscount = parseDiscountPercent(card.getAttribute(ATTRIBUTE.discount));
+            if (storedDiscount !== null) return storedDiscount;
+            if (this.discountCache.has(card)) return this.discountCache.get(card);
+
             const exactDiscount = parseDiscountPercent(firstText(card, [
                 '[class*="discount" i]',
                 '[class*="sale" i]',
                 '[class*="percent" i]'
             ]));
-            if (exactDiscount !== null) return exactDiscount;
+            if (exactDiscount !== null) {
+                this.discountCache.set(card, exactDiscount);
+                return exactDiscount;
+            }
 
-            return parseDiscountPercent(card.textContent);
+            const discount = parseDiscountPercent(card.textContent);
+            this.discountCache.set(card, discount);
+            return discount;
         },
         getItemHrefFromName(name) {
             return buildSteamListingUrl(this.getAppId(), name);
         },
         getImageUrl(card) {
             return Array.from(card.querySelectorAll?.('img') || [])
-                .map(img => img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || '')
+                .map(img => img.currentSrc
+                    || img.getAttribute('src')
+                    || img.getAttribute('data-src')
+                    || img.getAttribute('data-lazy-src')
+                    || img.getAttribute('data-profit-original-src')
+                    || img.getAttribute('data-profit-original-data-src')
+                    || '')
                 .find(src => src && !/^data:/i.test(src)) || '';
         },
         getLoadedItemContainer(link, boundary) {
@@ -1373,7 +1756,15 @@
                 const key = `${directName}|${price}|${href}`;
                 if (seen.has(key)) return;
                 seen.add(key);
-                items.push({ name: directName, price, imageUrl, discount, count, href });
+                items.push({
+                    name: directName,
+                    marketHashName: this.getSteamMarketHashName(card) || directName,
+                    price,
+                    imageUrl,
+                    discount,
+                    count,
+                    href
+                });
             });
 
             return items;
@@ -1387,12 +1778,29 @@
             const count = normalizeText(card.textContent).match(/\bx\s*(\d+)\b/iu)?.[1] || '';
             return {
                 name,
+                marketHashName: this.getSteamMarketHashName(card) || name,
                 price,
                 imageUrl: this.getImageUrl(card),
                 discount: this.getDiscount(card),
                 count,
                 href: link?.href || link?.getAttribute?.('href') || ''
             };
+        },
+        importLoadedCard(card) {
+            const item = this.itemFromCard(card);
+            parkCardImages(card);
+            const importedCard = document.importNode(card, true);
+            this.resetGeneratedCard(importedCard);
+            this.markCard(importedCard);
+
+            if (item) {
+                importedCard.setAttribute(ATTRIBUTE.marketHashName, item.marketHashName);
+                importedCard.setAttribute(ATTRIBUTE.price, String(item.price));
+                if (item.discount !== null && item.discount !== undefined) {
+                    importedCard.setAttribute(ATTRIBUTE.discount, String(item.discount));
+                }
+            }
+            return importedCard;
         },
         resetGeneratedCard(card) {
             card.querySelectorAll('.steam-highest-buy-order-link[data-profit-helper-badge="true"]').forEach(badge => badge.remove());
@@ -1415,7 +1823,7 @@
             }
 
             this.markCard(card);
-            card.setAttribute(ATTRIBUTE.marketHashName, item.name);
+            card.setAttribute(ATTRIBUTE.marketHashName, item.marketHashName || item.name);
             card.setAttribute(ATTRIBUTE.price, String(item.price));
             if (item.discount !== null && item.discount !== undefined) card.setAttribute(ATTRIBUTE.discount, String(item.discount));
 
@@ -1449,19 +1857,23 @@
             const url = new URL(baseUrl);
             searchParams.forEach((value, key) => url.searchParams.set(key, value));
             url.searchParams.set('page', String(pageNumber));
-            const doc = await fetchDocument(url.toString(), { signal: context.signal });
-            const cards = this.getCards(doc);
+            const fragment = await fetchInertHtmlFragment(url.toString(), { signal: context.signal });
+            const cards = this.getCards(fragment);
             if (cards.length) {
                 return {
                     page: pageNumber,
-                    cards: cards.map(card => {
-                        const item = this.itemFromCard(card);
-                        return item ? this.makeCard(item) : document.importNode(card, true);
-                    })
+                    cards: cards.map(card => this.importLoadedCard(card))
                 };
             }
 
-            return { page: pageNumber, cards: this.extractItems(doc).map(item => this.makeCard(item)) };
+            return {
+                page: pageNumber,
+                cards: this.extractItems(fragment).map(item => {
+                    const card = this.makeCard(item);
+                    parkCardImages(card);
+                    return card;
+                })
+            };
         }
     };
 
@@ -1618,7 +2030,7 @@
                     top: 8px !important;
                     left: 8px !important;
                     right: 8px !important;
-                    display: block !important;
+                    display: flex !important;
                     visibility: visible !important;
                     opacity: 1 !important;
                     pointer-events: auto !important;
@@ -2320,6 +2732,7 @@
         maxSiteWorkers: 4,
         totalPages: null,
         rubPerUsd: NaN,
+        offerCache: new Map(),
         matches: () => ['moon.market', 'www.moon.market'].includes(window.location.hostname)
             && /(?:^|\/)shop(?:\/|$)/i.test(window.location.pathname),
         getAppId() {
@@ -2336,10 +2749,11 @@
                     overflow: visible !important;
                 }
                 .moon-profit-card .steam-highest-buy-order-link[data-profit-helper-badge="true"] {
-                    top: 8px !important;
+                    top: auto !important;
+                    bottom: 8px !important;
                     left: 8px !important;
                     right: 8px !important;
-                    display: block !important;
+                    display: flex !important;
                     visibility: visible !important;
                     opacity: 1 !important;
                 }
@@ -2431,6 +2845,100 @@
             const steamReferencePrice = Number(item?.price_steam);
             if (!isValidPrice(sitePrice) || !isValidPrice(steamReferencePrice) || sitePrice >= steamReferencePrice) return null;
             return Math.round(((steamReferencePrice - sitePrice) / steamReferencePrice) * 100);
+        },
+        needsPriceValidation(item) {
+            const discount = this.getItemDiscount(item);
+            return discount !== null && discount >= CONFIG.moonPriceValidationDiscountPercent;
+        },
+        pruneOfferCache() {
+            const now = Date.now();
+            for (const [key, value] of this.offerCache.entries()) {
+                if (!value?.expiresAt || value.expiresAt <= now) this.offerCache.delete(key);
+            }
+            while (this.offerCache.size > CONFIG.maxMoonOfferCacheEntries) {
+                this.offerCache.delete(this.offerCache.keys().next().value);
+            }
+        },
+        buildOffersUrl(item) {
+            const url = new URL(window.location.pathname, window.location.origin);
+            url.searchParams.set('page_load', 'ajax');
+            url.searchParams.set('url', '/ajax/market2.ajax');
+            url.searchParams.set('action', 'item');
+            url.searchParams.set('mm_name', normalizeText(item?.name));
+            url.searchParams.set('sort', 'price_asc');
+            url.searchParams.set('appid', String(item?.app_id || this.getAppId()));
+            return url.toString();
+        },
+        async getCheapestOffer(item, signal) {
+            this.pruneOfferCache();
+            const cacheKey = `${item?.app_id || this.getAppId()}:${normalizeText(item?.name)}`;
+            let cached = this.offerCache.get(cacheKey);
+            if (!cached) {
+                const promise = fetchJson(this.buildOffersUrl(item), {
+                    signal,
+                    credentials: 'include'
+                }).then(data => {
+                    if (data?.error || !Array.isArray(data?.items)) {
+                        throw new Error(data?.error || 'офферы Moon Market не найдены');
+                    }
+                    const marketHashName = normalizeText(item?.name);
+                    const offers = data.items
+                        .filter(offer => normalizeText(offer?.name) === marketHashName && isValidPrice(Number(offer?.price)))
+                        .sort((a, b) => Number(a.price) - Number(b.price));
+                    if (!offers.length) throw new Error('доступные офферы Moon Market не найдены');
+                    return offers[0];
+                });
+                cached = {
+                    expiresAt: Date.now() + CONFIG.moonOfferCacheTtlMs,
+                    promise
+                };
+                this.offerCache.set(cacheKey, cached);
+                promise.catch(() => this.offerCache.delete(cacheKey));
+                this.pruneOfferCache();
+            }
+            return cached.promise;
+        },
+        async resolveItemPrice(item, signal) {
+            if (!this.needsPriceValidation(item)) return item;
+
+            try {
+                const offer = await this.getCheapestOffer(item, signal);
+                const catalogPrice = Number(item.price);
+                const actualPrice = Number(offer.price);
+                if (actualPrice !== catalogPrice) {
+                    logWork('WARN', 'Цена Moon Market уточнена по офферам', {
+                        item: item.name,
+                        catalogPrice: formatCurrency(catalogPrice * this.rubPerUsd),
+                        actualPrice: formatCurrency(actualPrice * this.rubPerUsd)
+                    });
+                }
+                return {
+                    ...item,
+                    ...offer,
+                    sell_count: item.sell_count,
+                    sell_count_exact: item.sell_count_exact
+                };
+            } catch (error) {
+                if (signal?.aborted) throw error;
+                logWork('ERROR', 'Не удалось уточнить цену Moon Market', {
+                    item: item?.name,
+                    error: error.message || String(error)
+                });
+                return null;
+            }
+        },
+        async resolveItemPrices(items, signal) {
+            const resolved = new Array(items.length);
+            let nextIndex = 0;
+            const worker = async () => {
+                while (nextIndex < items.length) {
+                    const index = nextIndex++;
+                    resolved[index] = await this.resolveItemPrice(items[index], signal);
+                }
+            };
+            const workersCount = Math.min(4, items.length);
+            await Promise.all(Array.from({ length: workersCount }, () => worker()));
+            return resolved.filter(Boolean);
         },
         parseItemFilters(item) {
             if (item?.filters && typeof item.filters === 'object') return item.filters;
@@ -2559,8 +3067,9 @@
 
             const totalPages = Number(data.pagination?.total);
             if (Number.isFinite(totalPages) && totalPages >= 0) this.totalPages = totalPages;
+            const resolvedItems = await this.resolveItemPrices(data.items, context.signal);
             const minDiscount = readNumberInput('discount-input', 0);
-            const cards = data.items
+            const cards = resolvedItems
                 .filter(item => {
                     const discount = this.getItemDiscount(item);
                     return minDiscount <= 0 || (discount !== null && discount >= minDiscount);
@@ -2589,10 +3098,6 @@
             const pathMatch = window.location.pathname.match(/\/market\/(\d+)/i);
             const pathAppId = parseInt(pathMatch?.[1], 10);
             return Number.isFinite(pathAppId) && pathAppId > 0 ? pathAppId : detectAppId(730);
-        },
-        getPageRequestDelayMs() {
-            const seconds = Math.max(0, Math.min(10, readNumberInput('skinport-delay-input', 1)));
-            return seconds * 1000;
         },
         getStyles() {
             return `
@@ -3231,18 +3736,57 @@
     }
 
     function createBadge(card, adapter = getCardAdapter(card)) {
-        const badge = document.createElement('a');
+        const badge = document.createElement('div');
         badge.className = 'steam-highest-buy-order-link';
         badge.setAttribute('data-profit-helper-badge', 'true');
-        badge.target = '_blank';
-        badge.innerText = 'Загружаю';
+        badge.dataset.refreshing = 'true';
+        badge.innerHTML = `
+            <a class="profit-helper-badge-link" target="_blank" rel="noopener noreferrer">
+                <span class="profit-helper-badge-text">Загружаю</span>
+            </a>
+            <button type="button" class="profit-helper-badge-refresh" title="Обновить цену" aria-label="Обновить цену" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M21 12a9 9 0 0 0-15.2-6.5L3 8"></path>
+                    <path d="M3 3v5h5"></path>
+                    <path d="M3 12a9 9 0 0 0 15.2 6.5L21 16"></path>
+                    <path d="M16 16h5v5"></path>
+                </svg>
+            </button>
+        `;
         badge.style.background = CONFIG.colors.loading;
         const container = adapter?.getBadgeContainer?.(card) || card;
         container.style.position = 'relative';
         container.appendChild(badge);
-        attachProfitTooltip(badge);
+        attachProfitTooltip(badge.querySelector('.profit-helper-badge-link'));
+        badge.querySelector('.profit-helper-badge-refresh')?.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            refreshSingleCard(card, adapter, badge);
+        });
         adapter?.onBadgeCreated?.(badge, card);
         return badge;
+    }
+
+    function getBadgeLink(badge) {
+        return badge?.querySelector?.('.profit-helper-badge-link') || badge;
+    }
+
+    function setBadgeText(badge, text) {
+        const textElement = badge?.querySelector?.('.profit-helper-badge-text');
+        if (textElement) textElement.textContent = text;
+        else if (badge) badge.innerText = text;
+    }
+
+    function setBadgeHref(badge, href) {
+        const link = getBadgeLink(badge);
+        if (link && href) link.href = href;
+    }
+
+    function setBadgeRefreshing(badge, isRefreshing) {
+        if (!badge) return;
+        badge.dataset.refreshing = isRefreshing ? 'true' : 'false';
+        const button = badge.querySelector?.('.profit-helper-badge-refresh');
+        if (button) button.disabled = isRefreshing;
     }
 
     function getTooltipRows(sitePrice, rows) {
@@ -3258,7 +3802,7 @@
         const tooltipRows = getTooltipRows(sitePrice, rows);
         if (!tooltipRows.length) return;
 
-        badge.dataset.profitTooltip = JSON.stringify(tooltipRows);
+        getBadgeLink(badge).dataset.profitTooltip = JSON.stringify(tooltipRows);
     }
 
     function hideProfitTooltip() {
@@ -3376,8 +3920,10 @@
     }
 
     function updateBadgeWithError(card, badge, text, color = CONFIG.colors.negative, resultStatus = RESULT_STATUS.error) {
-        badge.innerText = text;
+        restoreCardImages(card);
+        setBadgeText(badge, text);
         badge.style.background = color;
+        setBadgeRefreshing(badge, false);
         card.setAttribute(ATTRIBUTE.processed, '1');
         card.setAttribute(ATTRIBUTE.result, resultStatus);
         card.setAttribute(ATTRIBUTE.profit, '-999999');
@@ -3397,15 +3943,17 @@
     function updateBadgeWithProfit(card, badge, steamPrice, sitePrice, rows) {
         const sale = calculateSteamSale(steamPrice, sitePrice);
         const profitPercent = (sale.netProfit / sitePrice) * 100;
+        if (profitPercent >= readNumberInput('min-profit-input', -100)) restoreCardImages(card);
         card.setAttribute(ATTRIBUTE.profit, String(sale.netProfit));
         card.setAttribute(ATTRIBUTE.profitPercent, String(profitPercent));
         card.setAttribute(ATTRIBUTE.processed, '1');
         card.setAttribute(ATTRIBUTE.result, RESULT_STATUS.success);
 
         const orderText = rows?.[0]?.ordersCount ? ` [${rows[0].ordersCount} шт.]` : '';
-        badge.innerText = `${formatCurrency(steamPrice)}${orderText} (${sale.netProfit >= 0 ? '+' : ''}${formatCurrency(sale.netProfit)}, ${profitPercent >= 0 ? '+' : ''}${profitPercent.toFixed(2)}%)`;
+        setBadgeText(badge, `${formatCurrency(steamPrice)}${orderText} (${sale.netProfit >= 0 ? '+' : ''}${formatCurrency(sale.netProfit)}, ${profitPercent >= 0 ? '+' : ''}${profitPercent.toFixed(2)}%)`);
         setBadgeTooltipData(badge, sitePrice, rows);
         badge.style.background = getProfitColor(profitPercent);
+        setBadgeRefreshing(badge, false);
     }
 
     function sortAndPrune(adapter) {
@@ -3454,11 +4002,15 @@
 
             const discount = adapter.getDiscount(card);
             if (minDiscount > 0 && (discount === null || discount < minDiscount)) {
+                parkCardImages(card);
                 card.remove();
                 return;
             }
 
-            if (markQueued) card.setAttribute(ATTRIBUTE.queued, '1');
+            if (markQueued) {
+                card.setAttribute(ATTRIBUTE.queued, '1');
+                parkCardImages(card);
+            }
             cards.push(card);
         });
 
@@ -3476,10 +4028,14 @@
             if (img.dataset.profitOriginalSrc === undefined) {
                 img.dataset.profitOriginalSrc = img.getAttribute('src') || '';
                 img.dataset.profitOriginalSrcset = img.getAttribute('srcset') || '';
+                img.dataset.profitOriginalDataSrc = img.getAttribute('data-src') || '';
+                img.dataset.profitOriginalDataLazySrc = img.getAttribute('data-lazy-src') || '';
             }
             img.loading = 'lazy';
             img.removeAttribute('src');
             img.removeAttribute('srcset');
+            img.removeAttribute('data-src');
+            img.removeAttribute('data-lazy-src');
         });
     }
 
@@ -3487,14 +4043,25 @@
         card.querySelectorAll('img').forEach(img => {
             if (img.dataset.profitOriginalSrc) img.setAttribute('src', img.dataset.profitOriginalSrc);
             if (img.dataset.profitOriginalSrcset) img.setAttribute('srcset', img.dataset.profitOriginalSrcset);
+            if (img.dataset.profitOriginalDataSrc) img.setAttribute('data-src', img.dataset.profitOriginalDataSrc);
+            if (img.dataset.profitOriginalDataLazySrc) img.setAttribute('data-lazy-src', img.dataset.profitOriginalDataLazySrc);
             delete img.dataset.profitOriginalSrc;
             delete img.dataset.profitOriginalSrcset;
+            delete img.dataset.profitOriginalDataSrc;
+            delete img.dataset.profitOriginalDataLazySrc;
         });
+    }
+
+    function restoreAllParkedImages(root = document) {
+        const cards = uniqueElements(Array.from(root.querySelectorAll('img[data-profit-original-src]'))
+            .map(img => img.closest(`[${ATTRIBUTE.queued}], [${ATTRIBUTE.processed}]`) || img.parentElement));
+        cards.forEach(restoreCardImages);
     }
 
     function addLoadedCardsToPending(operation, adapter, cards) {
         cards.forEach(card => {
             if (!passesDiscountFilter(adapter, card)) {
+                parkCardImages(card);
                 card.remove();
                 return;
             }
@@ -3512,7 +4079,6 @@
         const cards = operation.pendingDetachedCards.splice(0);
         const fragment = document.createDocumentFragment();
         cards.forEach(card => {
-            restoreCardImages(card);
             card.setAttribute(ATTRIBUTE.queued, '1');
             fragment.appendChild(card);
         });
@@ -3547,13 +4113,51 @@
         return stats;
     }
 
-    function formatResultStats(adapter) {
+    function formatResultStats(adapter, operation = null) {
         const stats = getResultStats(adapter);
-        return `Готово: карточек ${stats.total}, выгодных ${stats.profitable}, ошибок ${stats.errors}, без заявок ${stats.noOrders}, не найдено ${stats.notFound}`;
+        const processedTotal = operation?.steamDone ?? stats.total;
+        return `Готово: обработано всего ${processedTotal}, в результатах ${stats.total}, выгодных ${stats.profitable}, ошибок ${stats.errors}, без заявок ${stats.noOrders}, не найдено ${stats.notFound}`;
     }
 
-    async function processCard(operation, adapter, card) {
-        if (!isOperationActive(operation)) return;
+    async function refreshSingleCard(card, adapter, badge) {
+        if (!card?.isConnected || badge?.dataset.refreshing === 'true') return;
+
+        const cardAdapter = getCardAdapter(card, adapter);
+        setBadgeRefreshing(badge, true);
+        setBadgeText(badge, 'Обновляю цену');
+        badge.style.background = CONFIG.colors.loading;
+        delete getBadgeLink(badge).dataset.profitTooltip;
+        logWork('INFO', 'Ручное обновление цены', {
+            site: cardAdapter.id,
+            cardName: cardAdapter.getName(card)
+        });
+
+        try {
+            await processCard(null, cardAdapter, card, {
+                badge,
+                forceSteamRefresh: true
+            });
+            logWork('INFO', 'Ручное обновление завершено', {
+                site: cardAdapter.id,
+                cardName: cardAdapter.getName(card),
+                result: card.getAttribute(ATTRIBUTE.result)
+            });
+        } catch (error) {
+            logWork('ERROR', 'Ошибка ручного обновления', {
+                site: cardAdapter.id,
+                cardName: cardAdapter.getName(card),
+                error: error.message || String(error)
+            });
+            updateBadgeWithError(card, badge, `Обновление: ${error.message || 'ошибка'}`);
+        } finally {
+            setBadgeRefreshing(badge, false);
+            if (card.isConnected) sortAndPrune(adapter);
+            updateRetryErrorsButton(adapter);
+        }
+    }
+
+    async function processCard(operation, adapter, card, { badge: existingBadge = null, forceSteamRefresh = false } = {}) {
+        if (operation && !isOperationActive(operation)) return;
 
         const cardAdapter = getCardAdapter(card, adapter);
         const name = cardAdapter.getName(card);
@@ -3562,40 +4166,79 @@
             : name;
         const sitePrice = cardAdapter.getPrice(card);
         const appId = cardAdapter.getAppId();
-        const badge = createBadge(card, cardAdapter);
+        const badge = existingBadge || createBadge(card, cardAdapter);
 
         if (!steamMarketHashName) {
+            logWork('ERROR', 'Не удалось определить имя предмета', {
+                site: cardAdapter.id,
+                cardName: name,
+                appId
+            });
             updateBadgeWithError(card, badge, 'Имя не найдено');
-            operation.steamDone++;
-            updateStatus(operation);
+            if (operation) {
+                operation.steamDone++;
+                updateStatus(operation);
+            }
             return;
         }
         if (!isValidPrice(sitePrice)) {
+            logWork('ERROR', 'Некорректная цена сайта', {
+                site: cardAdapter.id,
+                cardName: name,
+                marketHashName: steamMarketHashName,
+                price: sitePrice
+            });
             updateBadgeWithError(card, badge, 'Ошибка цены сайта');
-            operation.steamDone++;
-            updateStatus(operation);
+            if (operation) {
+                operation.steamDone++;
+                updateStatus(operation);
+            }
             return;
         }
 
         const targetUrl = cardAdapter.getSteamListingUrl?.(card, steamMarketHashName)
             || buildSteamListingUrl(appId, steamMarketHashName);
-        badge.href = targetUrl;
+        setBadgeHref(badge, targetUrl);
 
         try {
-            const result = await fetchSteamBestBuyOrder(appId, steamMarketHashName);
+            const result = await fetchSteamBestBuyOrder(appId, steamMarketHashName, {
+                forceRefresh: forceSteamRefresh
+            });
             if (result.status === 'not-found') {
+                logWork('WARN', 'Предмет не найден в Steam', {
+                    site: cardAdapter.id,
+                    cardName: name,
+                    marketHashName: steamMarketHashName,
+                    appId,
+                    url: targetUrl
+                });
                 updateBadgeWithError(card, badge, 'Предмет не найден', CONFIG.colors.notFound, RESULT_STATUS.notFound);
             } else if (result.status === 'no-orders') {
+                logWork('WARN', 'У предмета нет заявок Steam', {
+                    site: cardAdapter.id,
+                    marketHashName: steamMarketHashName,
+                    appId,
+                    url: targetUrl
+                });
                 updateBadgeWithError(card, badge, 'Нет заявок', CONFIG.colors.noOrders, RESULT_STATUS.noOrders);
             } else {
                 updateBadgeWithProfit(card, badge, result.steamPrice, sitePrice, result.rows);
             }
         } catch (error) {
+            logWork('ERROR', 'Ошибка запроса Steam', {
+                site: cardAdapter.id,
+                marketHashName: steamMarketHashName,
+                appId,
+                url: targetUrl,
+                error: error.message || String(error)
+            });
             updateBadgeWithError(card, badge, `Steam: ${error.message || 'ошибка'}`);
         } finally {
-            operation.steamDone++;
-            if (operation.steamDone % CONFIG.intermediateSortEvery === 0) sortAndPrune(adapter);
-            updateStatus(operation);
+            if (operation) {
+                operation.steamDone++;
+                if (operation.steamDone % CONFIG.intermediateSortEvery === 0) sortAndPrune(adapter);
+                updateStatus(operation);
+            }
         }
     }
 
@@ -3665,19 +4308,53 @@
             baseUrl: window.location.origin + window.location.pathname,
             searchParams: new URLSearchParams(window.location.search)
         };
-        operation.siteTotal = pagesCount;
+        const getRequestedPagesCount = () => Math.max(0, Math.min(999,
+            readNumberInput('pages-input', pagesCount)));
+        let lastRequestedPagesCount = getRequestedPagesCount();
+        const updateRequestedPagesCount = () => {
+            const requestedPagesCount = getRequestedPagesCount();
+            operation.siteTotal = Math.max(operation.siteLoaded, requestedPagesCount);
+            updateStatus(operation);
+
+            if (requestedPagesCount !== lastRequestedPagesCount) {
+                logWork('INFO', 'Изменено количество страниц', {
+                    site: adapter.id,
+                    pages: requestedPagesCount
+                });
+                lastRequestedPagesCount = requestedPagesCount;
+            }
+        };
+        const pagesInputs = [
+            document.getElementById('pages-input'),
+            document.getElementById('pages-input-range')
+        ].filter(Boolean);
+        const removePagesInputListeners = () => {
+            pagesInputs.forEach(input => input.removeEventListener('input', updateRequestedPagesCount));
+            operation.cleanups.delete(removePagesInputListeners);
+        };
+        pagesInputs.forEach(input => input.addEventListener('input', updateRequestedPagesCount));
+        operation.cleanups.add(removePagesInputListeners);
+
+        operation.siteTotal = lastRequestedPagesCount;
         operation.siteLoaded = 0;
 
         let nextPage = 2;
         const worker = async () => {
             while (isOperationActive(operation) && !operation.stopLoadingRequested) {
+                const requestedPagesCount = getRequestedPagesCount();
+                operation.siteTotal = Math.max(operation.siteLoaded, requestedPagesCount);
+                if (nextPage > requestedPagesCount + 1) return;
                 const pageNumber = nextPage++;
-                if (pageNumber > pagesCount + 1) return;
 
                 const { signal, cleanup } = withTimeout(operation, CONFIG.siteTimeoutMs);
                 try {
                     const result = await adapter.loadPage(pageNumber, { ...context, signal });
                     addLoadedCardsToPending(operation, adapter, result.cards);
+                    logWork('INFO', 'Страница сайта загружена', {
+                        site: adapter.id,
+                        page: pageNumber,
+                        cards: result.cards.length
+                    });
                     const pendingCount = getPendingEligibleCount(operation, adapter);
                     operation.pendingSteamTotal = pendingCount;
                     await processIntermediateCards(operation, adapter);
@@ -3688,17 +4365,23 @@
                     cleanup();
                     operation.cleanups.delete(cleanup);
                     operation.siteLoaded++;
+                    operation.siteTotal = Math.max(operation.siteLoaded, getRequestedPagesCount());
                     updateStatus(operation);
                 }
 
-                if (nextPage <= pagesCount + 1 && isOperationActive(operation) && !operation.stopLoadingRequested) {
-                    await waitForOperationDelay(operation, adapter.getPageRequestDelayMs?.() || 0);
+                if (nextPage <= getRequestedPagesCount() + 1 && isOperationActive(operation) && !operation.stopLoadingRequested) {
+                    const pageDelaySeconds = Math.max(0, Math.min(10, readNumberInput('page-delay-input', 1)));
+                    await waitForOperationDelay(operation, pageDelaySeconds * 1000);
                 }
             }
         };
 
-        await Promise.all(Array.from({ length: Math.min(siteWorkers, pagesCount) }, () => worker()));
-        if (operation.stopLoadingRequested) operation.siteTotal = operation.siteLoaded;
+        try {
+            await Promise.all(Array.from({ length: Math.min(siteWorkers, pagesCount) }, () => worker()));
+            if (operation.stopLoadingRequested) operation.siteTotal = operation.siteLoaded;
+        } finally {
+            removePagesInputListeners();
+        }
     }
 
     async function reloadInitialPage(operation, adapter) {
@@ -3717,6 +4400,10 @@
             const fragment = document.createDocumentFragment();
             result.cards.forEach(card => fragment.appendChild(card));
             grid.appendChild(fragment);
+            logWork('INFO', 'Начальная страница загружена через API', {
+                site: adapter.id,
+                cards: result.cards.length
+            });
         } finally {
             cleanup();
             operation.cleanups.delete(cleanup);
@@ -3743,6 +4430,12 @@
         }
 
         const operation = createOperation();
+        logWork('INFO', 'Повторная обработка ошибочных карточек', {
+            operation: operation.id,
+            site: adapter.id,
+            cards: cards.length,
+            steamWorkers: readNumberInput('steam-workers-input', 3)
+        });
         setStartButtonLoading(true);
         hideRetryErrorsButton();
         setStatus(`Повторяю ошибочные карточки: ${cards.length}`);
@@ -3756,7 +4449,7 @@
             if (!isOperationActive(operation)) return;
 
             sortAndPrune(adapter);
-            const resultText = formatResultStats(adapter);
+            const resultText = formatResultStats(adapter, operation);
             finishOperation(operation, resultText);
             updateRetryErrorsButton(adapter);
             showToast(getErroredCards(adapter).length ? 'Повтор завершен, часть карточек снова с ошибкой.' : 'Ошибочные карточки обработаны.');
@@ -3780,6 +4473,16 @@
         }
 
         const operation = createOperation();
+        logWork('INFO', 'Запуск обработки', {
+            operation: operation.id,
+            site: adapter.id,
+            discount: readNumberInput('discount-input', 0),
+            pages: readNumberInput('pages-input', 0),
+            siteWorkers: readNumberInput('site-workers-input', 4),
+            pageDelay: readNumberInput('page-delay-input', 1),
+            steamWorkers: readNumberInput('steam-workers-input', 3),
+            minProfit: readNumberInput('min-profit-input', -100)
+        });
         setStartButtonLoading(true);
         hideRetryErrorsButton();
         setStatus('Подготовка...');
@@ -3804,8 +4507,8 @@
             const cards = getCardsForSteam(adapter, operation);
             if (cards.length === 0) {
                 const resultText = operation.steamTotal > 0
-                    ? formatResultStats(adapter)
-                    : 'Готово. Подходящих карточек нет.';
+                    ? formatResultStats(adapter, operation)
+                    : `Готово: обработано всего ${operation.steamDone}. Подходящих карточек нет.`;
                 finishOperation(operation, resultText);
                 updateRetryErrorsButton(adapter);
                 showToast(resultText);
@@ -3816,7 +4519,7 @@
             if (!isOperationActive(operation)) return;
 
             sortAndPrune(adapter);
-            const resultText = formatResultStats(adapter);
+            const resultText = formatResultStats(adapter, operation);
             finishOperation(operation, resultText);
             updateRetryErrorsButton(adapter);
             showToast('Готово!');
