@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         lis-skins-profit-calculator
 // @namespace    http://tampermonkey.net
-// @version      19.18
+// @version      19.19
 // @description  lis-skins-profit-calculator
 // @author       p0pye + AI Helper
 // @match        https://lis-skins.com/*/market/*
@@ -2017,6 +2017,11 @@
         pageLimit: 160,
         reloadInitialPage: true,
         cardTemplate: null,
+        cardItemData: new WeakMap(),
+        rubRate: NaN,
+        rubRateFetchedAt: 0,
+        rubRatePromise: null,
+        rubRateTtlMs: 5 * 60 * 1000,
         matches: () => ['tradeit.gg', 'www.tradeit.gg'].includes(window.location.hostname)
             && Boolean(document.querySelector('.grid-items.store-grid .grid-row') || window.location.pathname.includes('/store')),
         getAppId: () => detectAppId(730),
@@ -2087,7 +2092,10 @@
 
             document.getElementById('profit-helper-tradeit-grid')?.remove();
             const cards = Array.from(grid.querySelectorAll(':scope > .grid-col, :scope > .tradeit-generated-card'));
-            const nativeTemplate = cards.find(card => !card.classList.contains('tradeit-generated-card'));
+            const nativeTemplate = cards.find(card => !card.classList.contains('tradeit-generated-card')
+                && card.querySelector('.item-cell img')
+                && card.querySelector('button[title="add to cart"]')
+                && card.querySelector('button[title="more details"]'));
             if (nativeTemplate) this.cardTemplate = nativeTemplate.cloneNode(true);
             cards.forEach(card => card.remove());
             grid.closest('.grid-items.store-grid')?.style.removeProperty('display');
@@ -2114,34 +2122,59 @@
         getStorePrice(item) {
             return parsePrice(getDeepValue(item, ['storePrice', 'priceForSale', 'priceForTrade', 'sitePrice', 'price']));
         },
-        findSelectedRate(value, seen = new WeakSet()) {
-            if (!value || typeof value !== 'object') return NaN;
-            if (seen.has(value)) return NaN;
-            seen.add(value);
+        getNuxtApp() {
+            try {
+                return window.useNuxtApp?.() || window.$nuxt || null;
+            } catch (_) {
+                return window.$nuxt || null;
+            }
+        },
+        getPiniaStore(id) {
+            return this.getNuxtApp()?.$pinia?._s?.get?.(id) || null;
+        },
+        getRuntimeRubRate() {
+            const currencyStore = this.getPiniaStore('currency');
+            const ratesRub = Number(currencyStore?.rates?.RUB);
+            if (isValidPrice(ratesRub)) return ratesRub;
 
-            if (value.selectedCurrency && isValidPrice(Number(value.selectedRate))) return Number(value.selectedRate);
-
-            for (const nested of Object.values(value)) {
-                const rate = this.findSelectedRate(nested, seen);
-                if (isValidPrice(rate)) return rate;
+            const selectedRate = Number(currencyStore?.selectedRate);
+            return currencyStore?.selectedCurrency === 'RUB' && isValidPrice(selectedRate)
+                ? selectedRate
+                : NaN;
+        },
+        async ensureRubRate(signal) {
+            const runtimeRate = this.getRuntimeRubRate();
+            if (isValidPrice(runtimeRate)) {
+                this.rubRate = runtimeRate;
+                this.rubRateFetchedAt = Date.now();
+                return runtimeRate;
             }
 
-            return NaN;
-        },
-        getSelectedRate() {
-            const runtimeRate = this.findSelectedRate(window.__NUXT__);
-            if (isValidPrice(runtimeRate)) return runtimeRate;
+            if (isValidPrice(this.rubRate) && Date.now() - this.rubRateFetchedAt < this.rubRateTtlMs) {
+                return this.rubRate;
+            }
+            if (this.rubRatePromise) return this.rubRatePromise;
 
-            const scriptsText = Array.from(document.scripts)
-                .map(script => script.textContent || '')
-                .find(text => text.includes('"selectedCurrency"') && text.includes('"selectedRate"'))
-                || '';
-            const match = scriptsText.match(/"selectedCurrency":\d+,"selectedRate":\d+,"rates":\d+\},"[A-Z0-9]+",([0-9.]+)/);
-            const rate = match ? Number(match[1]) : NaN;
-            return isValidPrice(rate) ? rate : 1;
+            this.rubRatePromise = fetchJson(new URL('/api/v2/exchange-rate', window.location.origin).toString(), {
+                signal,
+                credentials: 'include'
+            }).then(data => {
+                const rate = Number(data?.rates?.RUB);
+                if (!isValidPrice(rate)) throw new Error('Tradeit не вернул курс RUB');
+
+                this.rubRate = rate;
+                this.rubRateFetchedAt = Date.now();
+                logWork('INFO', 'Загружен курс Tradeit', { currency: 'RUB', rate });
+                return rate;
+            }).finally(() => {
+                this.rubRatePromise = null;
+            });
+
+            return this.rubRatePromise;
         },
         convertStorePrice(rawPrice) {
-            return Math.round((rawPrice / 100) * this.getSelectedRate() * 100) / 100;
+            if (!isValidPrice(this.rubRate)) return NaN;
+            return Math.round((rawPrice / 100) * this.rubRate * 100) / 100;
         },
         getStoreDiscount(item) {
             const explicitDiscount = getDeepValue(item, ['discount', 'discountPercent', 'discountPercentage', 'overstockDiffPercentage']);
@@ -2207,6 +2240,164 @@
                 }
             }
         },
+        getInventoryStore() {
+            return this.getPiniaStore('inventory');
+        },
+        async loadGroupItems(item, limit = this.pageLimit) {
+            if (getDeepValue(item, ['assetId', 'assetID', 'asset_id'])) return [item];
+
+            const groupId = getDeepValue(item, ['groupId', 'groupID', 'group_id']);
+            if (groupId === null || groupId === undefined || groupId === '') {
+                return [];
+            }
+
+            const inventoryStore = this.getInventoryStore();
+            if (typeof inventoryStore?.loadSiteInventory === 'function') {
+                const result = await inventoryStore.loadSiteInventory({
+                    fresh: true,
+                    groupId,
+                    isForStore: true,
+                    offset: 0,
+                    limit
+                });
+                if (Array.isArray(result?.items)) return result.items;
+            }
+
+            const url = new URL(this.buildUrl(1));
+            url.searchParams.set('groupId', String(groupId));
+            url.searchParams.set('offset', '0');
+            url.searchParams.set('limit', String(limit));
+            const data = await fetchJson(url.toString(), { credentials: 'include' });
+            return this.findItems(data);
+        },
+        makeCartItem(item) {
+            const imageUrl = normalizeText(getDeepValue(item, ['imgURL', 'image', 'imageUrl', 'imageURL', 'img', 'imgUrl', 'iconUrl', 'iconURL']));
+            const assetId = String(getDeepValue(item, ['assetId', 'assetID', 'asset_id']) || '');
+            const groupId = getDeepValue(item, ['groupId', 'groupID', 'group_id']);
+            const storePrice = this.getStorePrice(item);
+            const price = parsePrice(getDeepValue(item, ['price', 'priceForTrade', 'sitePrice'])) || storePrice;
+            const formattedStorePrice = formatCurrency(this.convertStorePrice(storePrice));
+            const formattedPrice = formatCurrency(this.convertStorePrice(price));
+            const imgUrls = imageUrl ? {
+                gridImgUrl: imageUrl,
+                mobileGridImgUrl: imageUrl,
+                infoImgUrl: imageUrl,
+                mobileInfoImgUrl: imageUrl,
+                cartImgUrl: imageUrl,
+                mobileCartImgUrl: imageUrl
+            } : {};
+
+            return {
+                ...item,
+                count: 1,
+                originalPrice: price,
+                checkoutPrice: storePrice,
+                isTradeAway: false,
+                itemKey: `siteInventory-${groupId}-${assetId}`,
+                formattedPrice,
+                formattedSitePrice: formattedPrice,
+                formattedStorePrice,
+                imgUrls
+            };
+        },
+        async addCardItemToCart(card, button) {
+            const groupedItem = this.cardItemData.get(card);
+            if (!groupedItem) throw new Error('данные карточки недоступны');
+
+            button.disabled = true;
+            try {
+                const inventoryStore = this.getInventoryStore();
+                const selectedItems = inventoryStore?.siteInventory?.storeSelectedItems;
+                if (!Array.isArray(selectedItems)) throw new Error('корзина Tradeit недоступна');
+
+                const loadedItems = await this.loadGroupItems(groupedItem, Math.min(this.pageLimit, 40));
+                const selectedAssetIds = new Set(selectedItems.map(item => String(item.assetId || '')));
+                const item = loadedItems
+                    .filter(candidate => !selectedAssetIds.has(String(candidate.assetId || '')))
+                    .sort((a, b) => this.getStorePrice(a) - this.getStorePrice(b))[0];
+                if (!item) throw new Error('нет свободных экземпляров');
+
+                selectedItems.push(this.makeCartItem(item));
+                logWork('INFO', 'Предмет Tradeit добавлен в корзину', {
+                    cardName: this.getItemName(item),
+                    assetId: item.assetId
+                });
+                showToast('Предмет добавлен в корзину Tradeit.');
+            } finally {
+                button.disabled = false;
+            }
+        },
+        async expandCardGroup(card, button) {
+            const groupedItem = this.cardItemData.get(card);
+            if (!groupedItem) throw new Error('данные карточки недоступны');
+            if (getDeepValue(groupedItem, ['assetId', 'assetID', 'asset_id'])) return;
+
+            button.disabled = true;
+            try {
+                const items = await this.loadGroupItems(groupedItem, this.pageLimit);
+                if (!items.length) throw new Error('экземпляры не найдены');
+
+                const fragment = document.createDocumentFragment();
+                items.forEach(item => {
+                    const expandedCard = this.makeCard(item);
+                    if (expandedCard) fragment.appendChild(expandedCard);
+                });
+                if (!fragment.childNodes.length) throw new Error('не удалось создать карточки');
+
+                card.replaceWith(fragment);
+                logWork('INFO', 'Группа Tradeit развернута', {
+                    cardName: this.getItemName(groupedItem),
+                    items: items.length
+                });
+            } finally {
+                button.disabled = false;
+            }
+        },
+        bindCardActions(card, item) {
+            this.cardItemData.set(card, item);
+            const addButton = card.querySelector('button[title="add to cart"], .buttons button:first-child');
+            const expandButton = card.querySelector('button[title="more details"], .more-btn, .buttons button:last-child');
+            const isIndividualItem = Boolean(getDeepValue(item, ['assetId', 'assetID', 'asset_id']));
+
+            if (addButton) {
+                addButton.title = 'Добавить в корзину';
+                addButton.disabled = false;
+                addButton.removeAttribute('aria-disabled');
+                addButton.classList.remove('v-btn--disabled');
+                addButton.addEventListener('click', event => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.addCardItemToCart(card, addButton).catch(error => {
+                        logWork('ERROR', 'Ошибка добавления Tradeit в корзину', {
+                            cardName: this.getItemName(item),
+                            error: error.message || String(error)
+                        });
+                        showToast(`Tradeit: ${error.message || 'ошибка корзины'}`, 'error');
+                    });
+                });
+            }
+
+            if (expandButton) {
+                expandButton.title = isIndividualItem ? 'Карточка экземпляра' : 'Развернуть группу';
+                expandButton.disabled = isIndividualItem;
+                expandButton.classList.toggle('v-btn--disabled', isIndividualItem);
+                if (!isIndividualItem) expandButton.removeAttribute('aria-disabled');
+                if (isIndividualItem) expandButton.style.display = 'none';
+                else {
+                    expandButton.addEventListener('click', event => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        this.expandCardGroup(card, expandButton).catch(error => {
+                            logWork('ERROR', 'Ошибка раскрытия группы Tradeit', {
+                                cardName: this.getItemName(item),
+                                error: error.message || String(error)
+                            });
+                            showToast(`Tradeit: ${error.message || 'ошибка раскрытия'}`, 'error');
+                        });
+                    });
+                }
+            }
+        },
         getItemCount(item, counts = {}) {
             const explicitCount = getDeepValue(item, ['count', 'amount', 'quantity', 'qty', 'stackSize']);
             if (Number.isFinite(Number(explicitCount))) return Number(explicitCount);
@@ -2222,7 +2413,7 @@
             if (!name || !isValidPrice(rawPrice)) return null;
             const price = this.convertStorePrice(rawPrice);
 
-            const imageValue = getDeepValue(item, ['image', 'imageUrl', 'imageURL', 'img', 'imgUrl', 'imgURL', 'iconUrl', 'iconURL']);
+            const imageValue = getDeepValue(item, ['imgURL', 'image', 'imageUrl', 'imageURL', 'img', 'imgUrl', 'iconUrl', 'iconURL']);
             const imageUrl = imageValue
                 ? (/^https?:\/\//i.test(String(imageValue)) ? String(imageValue) : `${STEAM_IMAGE_BASE_URL}${String(imageValue).replace(/^\/+/, '')}`)
                 : '';
@@ -2250,6 +2441,7 @@
                 `;
             }
             this.setCardData(card, { name, displayName, price, imageUrl, discount, count });
+            this.bindCardActions(card, item);
             return card;
         },
         findItems(data, depth = 0) {
@@ -2288,6 +2480,7 @@
             return url.toString();
         },
         async loadPage(pageNumber, context) {
+            await this.ensureRubRate(context.signal);
             const data = await fetchJson(this.buildUrl(pageNumber), { signal: context.signal, credentials: 'include' });
             const cards = this.findItems(data).map(item => this.makeCard(item, data?.counts || {})).filter(Boolean);
             return { page: pageNumber, cards };
